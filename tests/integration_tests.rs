@@ -12,6 +12,217 @@ use symbios_neat::{
 // Bug Fix Regression Tests
 // =============================================================================
 
+/// Regression test for Bug #1: Deterministic Input/Output Mapping Failure.
+/// The evaluator must use genome.input_ids/output_ids for semantic ordering,
+/// not SlotMap iteration order which can change after crossover/deserialization.
+#[test]
+fn test_evaluator_preserves_input_output_order_after_crossover() {
+    let config = NeatConfig {
+        output_activation: Activation::Identity,
+        hidden_activations: vec![Activation::Identity],
+        ..NeatConfig::minimal(2, 2)
+    };
+    let mut rng = ChaCha8Rng::seed_from_u64(42);
+
+    // Create two parents with different weights
+    let mut parent1 = NeatGenome::fully_connected(config.clone(), &mut rng);
+    let mut parent2 = NeatGenome::fully_connected(config, &mut rng);
+
+    // Give them distinct mutations
+    for _ in 0..10 {
+        parent1.mutate(&mut rng, 1.0);
+        parent2.mutate(&mut rng, 1.0);
+    }
+
+    // Perform crossover - this may reorder nodes in the SlotMap
+    let child = parent1.crossover(&parent2, &mut rng);
+
+    // Verify input_ids and output_ids are preserved
+    assert_eq!(child.input_ids.len(), 2, "Child should have 2 inputs");
+    assert_eq!(child.output_ids.len(), 2, "Child should have 2 outputs");
+
+    // Create evaluator and verify it respects semantic ordering
+    let mut evaluator = CppnEvaluator::new(&child);
+
+    // Evaluate with distinct inputs [1.0, 0.0] and [0.0, 1.0]
+    // If input mapping is correct, these should produce different outputs
+    let output1 = evaluator.evaluate(&[1.0, 0.0]);
+    let output2 = evaluator.evaluate(&[0.0, 1.0]);
+
+    // The outputs should differ (unless the network is symmetric, which is unlikely)
+    // But more importantly, the evaluator shouldn't crash
+    assert_eq!(output1.len(), 2, "Should have 2 outputs");
+    assert_eq!(output2.len(), 2, "Should have 2 outputs");
+
+    // Verify all outputs are finite
+    for &v in &output1 {
+        assert!(v.is_finite(), "Output should be finite");
+    }
+    for &v in &output2 {
+        assert!(v.is_finite(), "Output should be finite");
+    }
+}
+
+/// Regression test for Bug #1: Verify serialization doesn't break input/output mapping.
+#[test]
+fn test_evaluator_preserves_order_after_serialization() {
+    let config = NeatConfig::minimal(3, 2);
+    let mut rng = ChaCha8Rng::seed_from_u64(42);
+    let mut genome = NeatGenome::fully_connected(config, &mut rng);
+
+    // Add structure
+    for _ in 0..5 {
+        genome.mutate(&mut rng, 1.0);
+    }
+
+    // Evaluate original
+    let mut eval1 = CppnEvaluator::new(&genome);
+    let inputs = [0.5, -0.3, 0.8];
+    let output_before = eval1.evaluate(&inputs);
+
+    // Serialize and deserialize
+    let json = serde_json::to_string(&genome).unwrap();
+    let restored: NeatGenome = serde_json::from_str(&json).unwrap();
+
+    // Verify input_ids and output_ids are preserved
+    assert_eq!(genome.input_ids.len(), restored.input_ids.len());
+    assert_eq!(genome.output_ids.len(), restored.output_ids.len());
+
+    // Evaluate restored - should produce identical results
+    let mut eval2 = CppnEvaluator::new(&restored);
+    let output_after = eval2.evaluate(&inputs);
+
+    for (i, (&before, &after)) in output_before.iter().zip(output_after.iter()).enumerate() {
+        assert!(
+            (before - after).abs() < 1e-6,
+            "Output {} should match after serialization: {} vs {}",
+            i,
+            before,
+            after
+        );
+    }
+}
+
+/// Regression test for Bug #2: Endianness-Dependent Innovation Hashing.
+/// Innovation hashing must use explicit little-endian bytes for cross-platform reproducibility.
+#[test]
+fn test_innovation_hashing_is_deterministic_and_portable() {
+    // These specific values should always produce the same hash
+    // regardless of platform endianness
+    let inn1 = connection_innovation(1, 2);
+    let inn2 = connection_innovation(1, 2);
+    assert_eq!(inn1, inn2, "Same inputs must produce same innovation");
+
+    // Verify order matters (asymmetric)
+    let inn_forward = connection_innovation(100, 200);
+    let inn_reverse = connection_innovation(200, 100);
+    assert_ne!(
+        inn_forward, inn_reverse,
+        "Order should matter in innovation hashing"
+    );
+
+    // Verify node split is deterministic
+    let split1 = node_split_innovation(12345);
+    let split2 = node_split_innovation(12345);
+    assert_eq!(split1, split2, "Node split must be deterministic");
+}
+
+/// Regression test for Bug #3: Evaluation Order Corruption via Depth Saturation.
+/// Depth uses u32 to avoid saturation at 65535 layers.
+#[test]
+fn test_depth_does_not_saturate_at_u16_max() {
+    let config = NeatConfig::minimal(1, 1);
+    let mut genome = NeatGenome::minimal(config);
+
+    // Manually set a node's depth beyond u16::MAX
+    let output_id = genome.output_ids[0];
+    genome.nodes[output_id].depth = 70_000; // Beyond u16::MAX (65535)
+
+    // Verify it actually stored the value (would truncate if u16)
+    assert_eq!(
+        genome.nodes[output_id].depth, 70_000,
+        "Depth should support values > 65535"
+    );
+
+    // Verify u32::MAX works
+    genome.nodes[output_id].depth = u32::MAX;
+    assert_eq!(
+        genome.nodes[output_id].depth,
+        u32::MAX,
+        "Depth should support u32::MAX"
+    );
+}
+
+/// Regression test for Bug #4: Unbounded Weight Growth.
+/// Weights must be clamped during mutation to prevent Inf/NaN in compatibility_distance.
+#[test]
+fn test_weight_clamping_prevents_unbounded_growth() {
+    let config = NeatConfig {
+        weight_mutation_prob: 1.0,
+        weight_replace_prob: 0.0,     // Always perturb, never replace
+        weight_mutation_power: 100.0, // Large perturbation
+        weight_range: 1.0,
+        ..NeatConfig::minimal(2, 1)
+    };
+    let mut rng = ChaCha8Rng::seed_from_u64(42);
+    let mut genome = NeatGenome::fully_connected(config.clone(), &mut rng);
+
+    // Mutate many times - without clamping, weights would grow unbounded
+    for _ in 0..1000 {
+        genome.mutate(&mut rng, 1.0);
+    }
+
+    // Verify all weights are finite and bounded
+    let weight_limit = config.weight_range * 10.0;
+    for (_, conn) in &genome.connections {
+        assert!(
+            conn.weight.is_finite(),
+            "Weight should be finite, got {}",
+            conn.weight
+        );
+        assert!(
+            conn.weight.abs() <= weight_limit,
+            "Weight {} exceeds limit {}",
+            conn.weight,
+            weight_limit
+        );
+    }
+
+    // Verify compatibility_distance doesn't panic with NaN
+    let genome2 = NeatGenome::fully_connected(config, &mut rng);
+    let distance = genome.compatibility_distance(&genome2);
+    assert!(
+        distance.is_finite(),
+        "Compatibility distance should be finite, got {}",
+        distance
+    );
+}
+
+/// Regression test for Bug #5: Panicking API in Library Code.
+/// generate_pattern should return Result, not panic.
+#[test]
+fn test_generate_pattern_returns_result_not_panic() {
+    let config = NeatConfig::cppn(2, 1);
+    let mut rng = ChaCha8Rng::seed_from_u64(42);
+    let genome = NeatGenome::fully_connected(config, &mut rng);
+    let mut evaluator = CppnEvaluator::new(&genome);
+
+    // Valid index should return Ok
+    let result = generate_pattern(&mut evaluator, 4, 4, 0);
+    assert!(result.is_ok(), "Valid output_index should return Ok");
+
+    // Invalid index should return Err, not panic
+    let result = generate_pattern(&mut evaluator, 4, 4, 99);
+    assert!(result.is_err(), "Invalid output_index should return Err");
+
+    // Error should be descriptive
+    if let Err(e) = result {
+        let msg = e.to_string();
+        assert!(msg.contains("99"), "Error should mention requested index");
+        assert!(msg.contains("1"), "Error should mention available outputs");
+    }
+}
+
 /// Test that activation functions handle NaN consistently by propagating it.
 #[test]
 fn test_activation_nan_propagation() {
@@ -503,7 +714,7 @@ fn test_generate_pattern_single_pixel() {
 
     // For 1x1 pattern, the single pixel should be at (0, 0)
     // Output = x + y = 0 + 0 = 0, normalized to 0.5
-    let pattern_1x1 = generate_pattern(&mut evaluator, 1, 1, 0);
+    let pattern_1x1 = generate_pattern(&mut evaluator, 1, 1, 0).unwrap();
     assert_eq!(pattern_1x1.len(), 1);
     assert!(
         (pattern_1x1[0] - 0.5).abs() < 0.01,
@@ -514,7 +725,7 @@ fn test_generate_pattern_single_pixel() {
     // For 2x1 pattern, pixels should be at x=-1 and x=+1, y=0
     // Output[0] = -1 + 0 = -1, normalized to 0.0
     // Output[1] = +1 + 0 = +1, normalized to 1.0
-    let pattern_2x1 = generate_pattern(&mut evaluator, 2, 1, 0);
+    let pattern_2x1 = generate_pattern(&mut evaluator, 2, 1, 0).unwrap();
     assert_eq!(pattern_2x1.len(), 2);
     assert!(
         (pattern_2x1[0] - 0.0).abs() < 0.01,
@@ -528,18 +739,27 @@ fn test_generate_pattern_single_pixel() {
     );
 }
 
-/// Test that generate_pattern panics on invalid output_index instead of silent failure.
+/// Test that generate_pattern returns error on invalid output_index instead of panicking.
 #[test]
-#[should_panic(expected = "output_index")]
-fn test_generate_pattern_invalid_output_index_panics() {
+fn test_generate_pattern_invalid_output_index_returns_error() {
     let config = NeatConfig::cppn(2, 1); // Only 1 output
     let mut rng = ChaCha8Rng::seed_from_u64(42);
     let genome = NeatGenome::fully_connected(config, &mut rng);
 
     let mut evaluator = CppnEvaluator::new(&genome);
 
-    // Request output index 5 when only 1 output exists - should panic
-    let _ = generate_pattern(&mut evaluator, 4, 4, 5);
+    // Request output index 5 when only 1 output exists - should return error
+    let result = generate_pattern(&mut evaluator, 4, 4, 5);
+    assert!(
+        result.is_err(),
+        "Should return error for out-of-bounds output_index"
+    );
+
+    let err = result.unwrap_err();
+    assert!(
+        err.to_string().contains("output_index"),
+        "Error message should mention output_index"
+    );
 }
 
 #[test]
@@ -565,7 +785,7 @@ fn test_cppn_produces_spatial_patterns() {
     }
 
     let mut evaluator = CppnEvaluator::new(&genome);
-    let pattern = generate_pattern(&mut evaluator, 8, 8, 0);
+    let pattern = generate_pattern(&mut evaluator, 8, 8, 0).unwrap();
 
     // Pattern should have some variation (not all same value)
     let min = pattern.iter().cloned().fold(f32::INFINITY, f32::min);

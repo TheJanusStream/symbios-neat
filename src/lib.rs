@@ -101,7 +101,7 @@ pub mod innovation;
 
 // Re-exports for convenience
 pub use activation::Activation;
-pub use evaluator::{generate_pattern, CppnEvaluator};
+pub use evaluator::{generate_pattern, CppnEvaluator, PatternError};
 pub use gene::{ConnectionGene, ConnectionId, NodeGene, NodeId, NodeType};
 pub use genome::{NeatConfig, NeatGenome};
 pub use innovation::{
@@ -165,7 +165,7 @@ mod tests {
         let genome = NeatGenome::fully_connected(config, &mut rng);
 
         let mut evaluator = CppnEvaluator::new(&genome);
-        let pattern = generate_pattern(&mut evaluator, 16, 16, 0);
+        let pattern = generate_pattern(&mut evaluator, 16, 16, 0).unwrap();
 
         assert_eq!(pattern.len(), 256);
 

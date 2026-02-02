@@ -8,7 +8,7 @@
 //! For connections: `Hash(input_node_innovation, output_node_innovation)`
 //! For nodes (from split): `Hash(connection_innovation, SPLIT_MARKER)`
 
-use std::hash::{Hash, Hasher};
+use std::hash::Hasher;
 
 /// Marker value used when hashing node splits to distinguish from connection innovations.
 const SPLIT_MARKER: u64 = 0xDEAD_BEEF_CAFE_BABE;
@@ -74,8 +74,11 @@ impl Hasher for InnovationHasher {
 #[must_use]
 pub fn connection_innovation(input_innovation: u64, output_innovation: u64) -> u64 {
     let mut hasher = InnovationHasher::default();
-    input_innovation.hash(&mut hasher);
-    output_innovation.hash(&mut hasher);
+    // Use little-endian bytes for cross-platform reproducibility
+    // The standard Hash trait uses native endianness, which breaks
+    // compatibility between architectures (x86 vs MIPS/ARM big-endian)
+    hasher.write(&input_innovation.to_le_bytes());
+    hasher.write(&output_innovation.to_le_bytes());
     hasher.finish()
 }
 
@@ -96,8 +99,9 @@ pub fn connection_innovation(input_innovation: u64, output_innovation: u64) -> u
 #[must_use]
 pub fn node_split_innovation(connection_innovation: u64) -> u64 {
     let mut hasher = InnovationHasher::default();
-    connection_innovation.hash(&mut hasher);
-    SPLIT_MARKER.hash(&mut hasher);
+    // Use little-endian bytes for cross-platform reproducibility
+    hasher.write(&connection_innovation.to_le_bytes());
+    hasher.write(&SPLIT_MARKER.to_le_bytes());
     hasher.finish()
 }
 

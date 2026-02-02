@@ -48,8 +48,9 @@ pub struct NodeGene {
     /// Bias value added before activation (for hidden/output nodes).
     pub bias: f32,
     /// Cached depth for topological sorting (0 = input layer).
-    /// Recomputed when topology changes.
-    pub depth: u16,
+    /// Recomputed when topology changes. Uses u32 to avoid saturation
+    /// in adversarially deep networks (u16 would overflow at 65535 layers).
+    pub depth: u32,
 }
 
 impl NodeGene {
@@ -73,7 +74,7 @@ impl NodeGene {
             node_type: NodeType::Output,
             activation,
             bias: 0.0,
-            depth: u16::MAX,
+            depth: u32::MAX,
         }
     }
 

@@ -49,8 +49,6 @@ impl CppnEvaluator {
         let mut activations = Vec::with_capacity(nodes.len());
         let mut biases = Vec::with_capacity(nodes.len());
         let mut activation_fns = Vec::with_capacity(nodes.len());
-        let mut input_indices = Vec::new();
-        let mut output_indices = Vec::new();
         let mut bias_index = None;
         let mut eval_order = Vec::new();
 
@@ -63,15 +61,31 @@ impl CppnEvaluator {
             activation_fns.push(node.activation);
 
             match node.node_type {
-                NodeType::Input => input_indices.push(idx),
+                NodeType::Input => {} // Will be handled via genome.input_ids
                 NodeType::Output => {
-                    output_indices.push(idx);
+                    // Add to eval_order but not output_indices (handled via genome.output_ids)
                     eval_order.push(idx);
                 }
                 NodeType::Hidden => eval_order.push(idx),
                 NodeType::Bias => bias_index = Some(idx),
             }
         }
+
+        // Use genome.input_ids to preserve semantic input ordering
+        // This ensures Input 0 is always the first input, Input 1 is second, etc.
+        // regardless of SlotMap iteration order after crossover/deserialization
+        let input_indices: Vec<usize> = genome
+            .input_ids
+            .iter()
+            .filter_map(|id| node_id_to_idx.get(id).copied())
+            .collect();
+
+        // Use genome.output_ids to preserve semantic output ordering
+        let output_indices: Vec<usize> = genome
+            .output_ids
+            .iter()
+            .filter_map(|id| node_id_to_idx.get(id).copied())
+            .collect();
 
         // Build adjacency list: incoming connections for each node
         let mut incoming: Vec<Vec<(usize, f32)>> = vec![Vec::new(); activations.len()];
@@ -228,6 +242,35 @@ impl CppnEvaluator {
     }
 }
 
+/// Error type for pattern generation failures.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PatternError {
+    /// The requested output index exceeds the number of network outputs.
+    OutputIndexOutOfBounds {
+        /// The requested index.
+        requested: usize,
+        /// The actual number of outputs.
+        available: usize,
+    },
+}
+
+impl std::fmt::Display for PatternError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PatternError::OutputIndexOutOfBounds {
+                requested,
+                available,
+            } => write!(
+                f,
+                "output_index {} out of bounds for network with {} outputs",
+                requested, available
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PatternError {}
+
 /// Generate a 2D pattern image from a CPPN.
 ///
 /// # Arguments
@@ -239,14 +282,27 @@ impl CppnEvaluator {
 ///
 /// # Returns
 ///
-/// A flattened grayscale image as `f32` values in `[0, 1]`.
+/// A flattened grayscale image as `f32` values in `[0, 1]`, or an error if
+/// the output index is out of bounds.
+///
+/// # Errors
+///
+/// Returns [`PatternError::OutputIndexOutOfBounds`] if `output_index` >= number of outputs.
 #[allow(clippy::cast_precision_loss)] // Image dimensions are small enough
 pub fn generate_pattern(
     evaluator: &mut CppnEvaluator,
     width: usize,
     height: usize,
     output_index: usize,
-) -> Vec<f32> {
+) -> Result<Vec<f32>, PatternError> {
+    // Validate output_index upfront to fail fast
+    if output_index >= evaluator.num_outputs() {
+        return Err(PatternError::OutputIndexOutOfBounds {
+            requested: output_index,
+            available: evaluator.num_outputs(),
+        });
+    }
+
     let mut pattern = Vec::with_capacity(width * height);
 
     // For mapping pixel indices to [-1, 1] range:
@@ -276,13 +332,8 @@ pub fn generate_pattern(
             };
 
             evaluator.evaluate_into(&inputs, &mut outputs);
-            let value = outputs.get(output_index).copied().unwrap_or_else(|| {
-                panic!(
-                    "output_index {} out of bounds for network with {} outputs",
-                    output_index,
-                    outputs.len()
-                )
-            });
+            // SAFETY: We validated output_index at function entry
+            let value = outputs[output_index];
 
             // Normalize output to [0, 1]
             let normalized = value.mul_add(0.5, 0.5);
@@ -290,7 +341,7 @@ pub fn generate_pattern(
         }
     }
 
-    pattern
+    Ok(pattern)
 }
 
 #[cfg(test)]
@@ -372,7 +423,7 @@ mod tests {
         let genome = NeatGenome::fully_connected(config, &mut rng);
 
         let mut evaluator = CppnEvaluator::new(&genome);
-        let pattern = generate_pattern(&mut evaluator, 8, 8, 0);
+        let pattern = generate_pattern(&mut evaluator, 8, 8, 0).unwrap();
 
         assert_eq!(pattern.len(), 64);
         for &val in &pattern {

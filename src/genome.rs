@@ -561,6 +561,10 @@ impl NeatGenome {
 
     /// Mutate weights of existing connections.
     fn mutate_weights<R: Rng>(&mut self, rng: &mut R) {
+        // Clamp weights to prevent unbounded growth that leads to Inf/NaN
+        // in compatibility_distance calculations (Inf - Inf = NaN causes panics)
+        let weight_limit = self.config.weight_range * 10.0;
+
         for (_, conn) in &mut self.connections {
             if rng.random::<f32>() < self.config.weight_mutation_prob {
                 if rng.random::<f32>() < self.config.weight_replace_prob {
@@ -572,6 +576,8 @@ impl NeatGenome {
                     conn.weight +=
                         (rng.random::<f32>() * 2.0 - 1.0) * self.config.weight_mutation_power;
                 }
+                // Clamp to prevent unbounded growth
+                conn.weight = conn.weight.clamp(-weight_limit, weight_limit);
             }
         }
     }

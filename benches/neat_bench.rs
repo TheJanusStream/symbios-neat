@@ -80,7 +80,7 @@ fn bench_evaluation(c: &mut Criterion) {
 
     c.bench_function("cppn_generate_pattern_32x32", |b| {
         b.iter(|| {
-            black_box(generate_pattern(&mut evaluator, 32, 32, 0));
+            let _ = black_box(generate_pattern(&mut evaluator, 32, 32, 0));
         });
     });
 }
