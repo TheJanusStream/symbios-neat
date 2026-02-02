@@ -13,10 +13,15 @@ use std::hash::{Hash, Hasher};
 /// Marker value used when hashing node splits to distinguish from connection innovations.
 const SPLIT_MARKER: u64 = 0xDEAD_BEEF_CAFE_BABE;
 
+/// Reserved range for fixed innovation IDs (bias, input, output nodes).
+/// Hash-based innovations will always be >= this value.
+const RESERVED_INNOVATION_RANGE: u64 = 1 << 16; // 65536
+
 /// A deterministic hasher for computing innovation numbers.
 ///
 /// Uses FxHash-style multiplication for speed while maintaining
-/// good distribution properties.
+/// good distribution properties. The output is guaranteed to be
+/// >= RESERVED_INNOVATION_RANGE to avoid collisions with fixed node IDs.
 #[derive(Default)]
 struct InnovationHasher {
     state: u64,
@@ -42,7 +47,12 @@ impl Hasher for InnovationHasher {
         h ^= h >> 33;
         h = h.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
         h ^= h >> 33;
-        h
+
+        // Ensure hash never collides with reserved range for fixed node IDs.
+        // Map the hash to [RESERVED_INNOVATION_RANGE, u64::MAX] while
+        // preserving uniform distribution.
+        let range = u64::MAX - RESERVED_INNOVATION_RANGE;
+        RESERVED_INNOVATION_RANGE + (h % range)
     }
 }
 

@@ -56,6 +56,87 @@ fn test_activation_extreme_values() {
     }
 }
 
+/// Test that Identity activation clamps to prevent overflow propagation.
+/// Without clamping, large weights can cause INFINITY to propagate through the network.
+#[test]
+fn test_identity_activation_bounded() {
+    // Identity should clamp to prevent downstream overflow
+    let result_pos_inf = Activation::Identity.apply(f32::INFINITY);
+    let result_neg_inf = Activation::Identity.apply(f32::NEG_INFINITY);
+    let result_large = Activation::Identity.apply(1e30);
+    let result_small = Activation::Identity.apply(-1e30);
+
+    // All results should be finite and bounded
+    assert!(
+        result_pos_inf.is_finite(),
+        "Identity(+inf) should be finite, got {}",
+        result_pos_inf
+    );
+    assert!(
+        result_neg_inf.is_finite(),
+        "Identity(-inf) should be finite, got {}",
+        result_neg_inf
+    );
+    assert!(
+        result_large.is_finite() && result_large.abs() <= 1e6,
+        "Identity(1e30) should be bounded to 1e6, got {}",
+        result_large
+    );
+    assert!(
+        result_small.is_finite() && result_small.abs() <= 1e6,
+        "Identity(-1e30) should be bounded to 1e6, got {}",
+        result_small
+    );
+}
+
+/// Test that a network with Identity activation doesn't overflow with large weights.
+#[test]
+fn test_network_no_overflow_with_large_weights() {
+    let config = NeatConfig {
+        output_activation: Activation::Identity,
+        hidden_activations: vec![Activation::Identity],
+        weight_range: 100.0, // Large weights
+        ..NeatConfig::minimal(2, 1)
+    };
+    let mut rng = ChaCha8Rng::seed_from_u64(42);
+    let mut genome = NeatGenome::fully_connected(config, &mut rng);
+
+    // Set weights to extreme values
+    for (_, conn) in &mut genome.connections {
+        conn.weight = 1000.0;
+    }
+
+    // Add several hidden nodes with Identity
+    for _ in 0..5 {
+        if let Some(conn_id) = genome
+            .connections
+            .iter()
+            .filter(|(_, c)| c.enabled)
+            .next()
+            .map(|(id, _)| id)
+        {
+            genome.add_node(conn_id, &mut rng);
+        }
+    }
+
+    // Set all weights to large values again
+    for (_, conn) in &mut genome.connections {
+        if conn.enabled {
+            conn.weight = 1000.0;
+        }
+    }
+
+    let mut evaluator = CppnEvaluator::new(&genome);
+    let output = evaluator.evaluate(&[100.0, 100.0]);
+
+    // Output should be finite, not overflow to infinity
+    assert!(
+        output[0].is_finite(),
+        "Network output should be finite even with large weights, got {}",
+        output[0]
+    );
+}
+
 /// Test that update_depths doesn't infinite loop (has iteration limit).
 #[test]
 fn test_update_depths_terminates() {
@@ -277,6 +358,45 @@ fn test_full_evolution_cycle() {
     }
 }
 
+/// Test that hash-based innovation numbers don't collide with fixed node IDs.
+/// NeatGenome::minimal assigns innovation 0, 1, 2, ... to nodes.
+/// Hash-based innovations should never produce these low values.
+#[test]
+fn test_innovation_no_collision_with_fixed_ids() {
+    // The fixed IDs used by NeatGenome::minimal are:
+    // - Bias: 0
+    // - Inputs: 1..=num_inputs
+    // - Outputs: num_inputs+1..=num_inputs+num_outputs
+    // For a typical network with 10 inputs and 5 outputs, fixed IDs are 0..=15
+
+    let reserved_range = 1000u64; // Conservative upper bound for fixed IDs
+
+    // Test many connection innovations
+    for i in 0..1000u64 {
+        for j in 0..100u64 {
+            let inn = connection_innovation(i, j);
+            assert!(
+                inn >= reserved_range,
+                "Connection innovation {} (from {}, {}) collides with reserved range",
+                inn,
+                i,
+                j
+            );
+        }
+    }
+
+    // Test node split innovations
+    for conn_inn in 0..10000u64 {
+        let node_inn = node_split_innovation(conn_inn);
+        assert!(
+            node_inn >= reserved_range,
+            "Node split innovation {} (from conn {}) collides with reserved range",
+            node_inn,
+            conn_inn
+        );
+    }
+}
+
 #[test]
 fn test_structural_innovation_consistency() {
     let config = NeatConfig::minimal(2, 1);
@@ -352,6 +472,74 @@ fn test_node_split_creates_correct_topology() {
     // Verify innovation is deterministic
     let expected_node_inn = node_split_innovation(original_conn.innovation);
     assert_eq!(new_node.innovation, expected_node_inn);
+}
+
+/// Test that generate_pattern handles edge case of width=1 or height=1 correctly.
+/// A single pixel should be centered at 0.0, not at the boundary.
+#[test]
+fn test_generate_pattern_single_pixel() {
+    let config = NeatConfig {
+        output_activation: Activation::Identity,
+        ..NeatConfig::cppn(2, 1)
+    };
+    let mut rng = ChaCha8Rng::seed_from_u64(42);
+    let mut genome = NeatGenome::fully_connected(config, &mut rng);
+
+    // Set weights so output = x + y (first input + second input)
+    // With Identity activation, this lets us verify the input coordinates
+    let mut conn_iter = genome.connections.iter_mut();
+    if let Some((_, conn)) = conn_iter.next() {
+        conn.weight = 1.0; // x weight
+    }
+    if let Some((_, conn)) = conn_iter.next() {
+        conn.weight = 1.0; // y weight
+    }
+    // Disable any other connections (bias)
+    for (_, conn) in conn_iter {
+        conn.enabled = false;
+    }
+
+    let mut evaluator = CppnEvaluator::new(&genome);
+
+    // For 1x1 pattern, the single pixel should be at (0, 0)
+    // Output = x + y = 0 + 0 = 0, normalized to 0.5
+    let pattern_1x1 = generate_pattern(&mut evaluator, 1, 1, 0);
+    assert_eq!(pattern_1x1.len(), 1);
+    assert!(
+        (pattern_1x1[0] - 0.5).abs() < 0.01,
+        "1x1 pattern should be centered (0.5), got {}",
+        pattern_1x1[0]
+    );
+
+    // For 2x1 pattern, pixels should be at x=-1 and x=+1, y=0
+    // Output[0] = -1 + 0 = -1, normalized to 0.0
+    // Output[1] = +1 + 0 = +1, normalized to 1.0
+    let pattern_2x1 = generate_pattern(&mut evaluator, 2, 1, 0);
+    assert_eq!(pattern_2x1.len(), 2);
+    assert!(
+        (pattern_2x1[0] - 0.0).abs() < 0.01,
+        "2x1 pattern[0] should be 0.0 (x=-1), got {}",
+        pattern_2x1[0]
+    );
+    assert!(
+        (pattern_2x1[1] - 1.0).abs() < 0.01,
+        "2x1 pattern[1] should be 1.0 (x=+1), got {}",
+        pattern_2x1[1]
+    );
+}
+
+/// Test that generate_pattern panics on invalid output_index instead of silent failure.
+#[test]
+#[should_panic(expected = "output_index")]
+fn test_generate_pattern_invalid_output_index_panics() {
+    let config = NeatConfig::cppn(2, 1); // Only 1 output
+    let mut rng = ChaCha8Rng::seed_from_u64(42);
+    let genome = NeatGenome::fully_connected(config, &mut rng);
+
+    let mut evaluator = CppnEvaluator::new(&genome);
+
+    // Request output index 5 when only 1 output exists - should panic
+    let _ = generate_pattern(&mut evaluator, 4, 4, 5);
 }
 
 #[test]
@@ -440,6 +628,95 @@ fn test_compatibility_distance_properties() {
     );
 }
 
+/// Test that node depth is computed as longest path from inputs (not shortest).
+/// This is critical for correct feedforward evaluation order.
+#[test]
+fn test_depth_is_longest_path() {
+    let config = NeatConfig::minimal(2, 1);
+    let mut rng = ChaCha8Rng::seed_from_u64(42);
+    let mut genome = NeatGenome::fully_connected(config, &mut rng);
+
+    // Get initial state: input0 -> output, input1 -> output
+    // Both inputs at depth 0, output should be at depth 1
+    let output_id = genome.output_ids[0];
+    assert_eq!(
+        genome.nodes[output_id].depth, 1,
+        "Output should be at depth 1 with direct connections"
+    );
+
+    // Now split one connection: input0 -> hidden -> output
+    // The hidden node will be at depth 1
+    // The output now receives from:
+    //   - input1 (depth 0) -> path length 1
+    //   - hidden (depth 1) -> path length 2
+    // Output depth should be MAX(1, 2) = 2, not MIN(1, 2) = 1
+    let conn_id = genome.connections.iter().next().unwrap().0;
+    let hidden_id = genome.add_node(conn_id, &mut rng).unwrap();
+
+    let hidden_depth = genome.nodes[hidden_id].depth;
+    let output_depth = genome.nodes[output_id].depth;
+
+    assert_eq!(hidden_depth, 1, "Hidden node should be at depth 1");
+    assert_eq!(
+        output_depth, 2,
+        "Output should be at depth 2 (longest path), not 1 (shortest path)"
+    );
+}
+
+/// Test that evaluation order respects node dependencies.
+/// A node should not be evaluated until all its inputs are ready.
+#[test]
+fn test_evaluation_order_respects_dependencies() {
+    let config = NeatConfig {
+        output_activation: Activation::Identity,
+        hidden_activations: vec![Activation::Identity],
+        ..NeatConfig::minimal(2, 1)
+    };
+    let mut rng = ChaCha8Rng::seed_from_u64(42);
+    let mut genome = NeatGenome::fully_connected(config, &mut rng);
+
+    // Set all weights to 1.0 for predictable math
+    for (_, conn) in &mut genome.connections {
+        conn.weight = 1.0;
+    }
+
+    // Initial network: input0 + input1 -> output
+    // With identity activation and weights 1.0: output = input0 + input1
+    let mut evaluator = CppnEvaluator::new(&genome);
+    let output = evaluator.evaluate(&[1.0, 2.0]);
+    assert!(
+        (output[0] - 3.0).abs() < 1e-5,
+        "Simple sum should work: expected 3.0, got {}",
+        output[0]
+    );
+
+    // Now split one connection to create a hidden node
+    // input0 -> hidden (weight 1.0)
+    // hidden -> output (original weight 1.0)
+    // input1 -> output (weight 1.0)
+    // So: output = hidden + input1 = input0 + input1 = 3.0
+    let conn_id = genome.connections.iter().next().unwrap().0;
+    genome.add_node(conn_id, &mut rng);
+
+    // Set all weights to 1.0 again
+    for (_, conn) in &mut genome.connections {
+        if conn.enabled {
+            conn.weight = 1.0;
+        }
+    }
+
+    let mut evaluator = CppnEvaluator::new(&genome);
+    let output = evaluator.evaluate(&[1.0, 2.0]);
+
+    // If depth is wrong, hidden might not be evaluated before output
+    // causing output to miss the hidden->output signal
+    assert!(
+        (output[0] - 3.0).abs() < 1e-5,
+        "With hidden node, sum should still be ~3.0, got {} (depth bug if < 3)",
+        output[0]
+    );
+}
+
 #[test]
 fn test_serialization_preserves_behavior() {
     let config = NeatConfig::cppn(2, 1);
@@ -469,6 +746,27 @@ fn test_serialization_preserves_behavior() {
         "Serialization should preserve behavior: {} vs {}",
         output1[0],
         output2[0]
+    );
+}
+
+/// Test that Step activation uses standard Heaviside convention: f(x) = 1 for x >= 0.
+#[test]
+fn test_step_activation_at_zero() {
+    // Standard Heaviside step function: f(x) = 1 for x >= 0, f(x) = 0 for x < 0
+    assert_eq!(
+        Activation::Step.apply(0.0),
+        1.0,
+        "Step(0) should be 1.0 (Heaviside convention)"
+    );
+    assert_eq!(
+        Activation::Step.apply(0.001),
+        1.0,
+        "Step(positive) should be 1.0"
+    );
+    assert_eq!(
+        Activation::Step.apply(-0.001),
+        0.0,
+        "Step(negative) should be 0.0"
     );
 }
 

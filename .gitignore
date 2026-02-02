@@ -1,8 +1,8 @@
 /target
 **/*.rs.bk
-Cargo.lock
 /.claude
 /.chainlink
+Cargo.lock
 CHANGELOG.md
 symbios-neat-primer.sh
 symbios_neat_primer_*

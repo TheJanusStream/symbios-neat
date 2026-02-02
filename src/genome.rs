@@ -302,23 +302,17 @@ impl NeatGenome {
     /// Check if adding a connection from input_id to output_id would create a cycle.
     fn would_create_cycle(&self, input_id: NodeId, output_id: NodeId) -> bool {
         // BFS from output_id to see if we can reach input_id
-        let mut visited = vec![false; self.nodes.len()];
+        // Use HashSet directly instead of mapping NodeId to index
+        let mut visited = std::collections::HashSet::with_capacity(self.nodes.len());
         let mut queue = vec![output_id];
-
-        // Map NodeId to index for visited array
-        let id_to_idx: std::collections::HashMap<NodeId, usize> =
-            self.nodes.keys().enumerate().map(|(i, k)| (k, i)).collect();
 
         while let Some(current) = queue.pop() {
             if current == input_id {
                 return true;
             }
 
-            if let Some(&idx) = id_to_idx.get(&current) {
-                if visited[idx] {
-                    continue;
-                }
-                visited[idx] = true;
+            if !visited.insert(current) {
+                continue; // Already visited
             }
 
             // Find all nodes that current connects TO
@@ -334,18 +328,23 @@ impl NeatGenome {
 
     /// Update node depths for topological evaluation order.
     ///
+    /// Depth is computed as the longest path from any input node, ensuring
+    /// that a node is only evaluated after ALL its predecessors are ready.
+    /// This is critical for correct feedforward evaluation.
+    ///
     /// Returns `true` if the graph is acyclic and depths were computed successfully,
     /// `false` if a cycle was detected (iteration limit exceeded).
     pub fn update_depths(&mut self) -> bool {
-        // Reset all depths
+        // Reset all depths: inputs/bias at 0, others at 0 (will be updated to max)
         for (_, node) in &mut self.nodes {
             node.depth = match node.node_type {
                 NodeType::Input | NodeType::Bias => 0,
-                _ => u16::MAX,
+                _ => 0, // Will be updated to longest path
             };
         }
 
         // Iteratively propagate depths until stable.
+        // For longest path: depth = max(all_predecessor_depths) + 1
         // Limit iterations to prevent infinite loops on cyclic graphs.
         // In an acyclic graph, we need at most N iterations (longest path length).
         let max_iterations = self.nodes.len();
@@ -363,8 +362,9 @@ impl NeatGenome {
                 if let (Some(input_node), Some(output_node)) =
                     (self.nodes.get(conn.input), self.nodes.get(conn.output))
                 {
+                    // Longest path: take maximum of all incoming paths
                     let new_depth = input_node.depth.saturating_add(1);
-                    if new_depth < output_node.depth {
+                    if new_depth > output_node.depth {
                         // Safe because we're iterating connections, not nodes
                         if let Some(output_node) = self.nodes.get_mut(conn.output) {
                             output_node.depth = new_depth;

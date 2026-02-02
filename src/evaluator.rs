@@ -249,8 +249,11 @@ pub fn generate_pattern(
 ) -> Vec<f32> {
     let mut pattern = Vec::with_capacity(width * height);
 
-    let width_f = width as f32;
-    let height_f = height as f32;
+    // For mapping pixel indices to [-1, 1] range:
+    // - Single pixel (dim=1): center at 0.0
+    // - Multiple pixels: span from -1.0 to +1.0 inclusive
+    let x_divisor = if width > 1 { (width - 1) as f32 } else { 1.0 };
+    let y_divisor = if height > 1 { (height - 1) as f32 } else { 1.0 };
 
     // Pre-allocate buffers for allocation-free inner loop
     let mut inputs = [0.0f32; 2];
@@ -259,11 +262,27 @@ pub fn generate_pattern(
     for y in 0..height {
         for x in 0..width {
             // Normalize coordinates to [-1, 1]
-            inputs[0] = (x as f32 / width_f).mul_add(2.0, -1.0);
-            inputs[1] = (y as f32 / height_f).mul_add(2.0, -1.0);
+            // For dim=1: coordinate is 0.0 (centered)
+            // For dim>1: maps [0, dim-1] to [-1, 1]
+            inputs[0] = if width == 1 {
+                0.0
+            } else {
+                (x as f32 / x_divisor).mul_add(2.0, -1.0)
+            };
+            inputs[1] = if height == 1 {
+                0.0
+            } else {
+                (y as f32 / y_divisor).mul_add(2.0, -1.0)
+            };
 
             evaluator.evaluate_into(&inputs, &mut outputs);
-            let value = outputs.get(output_index).copied().unwrap_or(0.0);
+            let value = outputs.get(output_index).copied().unwrap_or_else(|| {
+                panic!(
+                    "output_index {} out of bounds for network with {} outputs",
+                    output_index,
+                    outputs.len()
+                )
+            });
 
             // Normalize output to [0, 1]
             let normalized = value.mul_add(0.5, 0.5);

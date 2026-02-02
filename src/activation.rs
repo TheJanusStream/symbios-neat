@@ -73,8 +73,16 @@ impl Activation {
             return f32::NAN;
         }
 
+        // Clamp bound to prevent overflow propagation in Identity and unbounded functions.
+        // 1e6 is large enough to represent meaningful signals but small enough
+        // that weight * activation won't overflow f32 in typical networks.
+        const CLAMP_BOUND: f32 = 1e6;
+
         match self {
-            Self::Identity => x,
+            Self::Identity => {
+                // Clamp to prevent infinity propagation and downstream overflow
+                x.clamp(-CLAMP_BOUND, CLAMP_BOUND)
+            }
             Self::Sigmoid => {
                 // Handle infinity: sigmoid(+inf) = 1, sigmoid(-inf) = 0
                 if x == f32::INFINITY {
@@ -98,10 +106,8 @@ impl Activation {
                 x.tanh()
             }
             Self::ReLU => {
-                if x == f32::NEG_INFINITY {
-                    return 0.0;
-                }
-                x.max(0.0)
+                // Clamp to prevent overflow propagation
+                x.clamp(0.0, CLAMP_BOUND)
             }
             Self::Sine => {
                 // sin(infinity) is undefined; clamp to bounded range
@@ -130,26 +136,22 @@ impl Activation {
                 }
             }
             Self::Abs => {
-                // abs(-inf) = +inf, abs(+inf) = +inf
-                x.abs()
+                // Clamp to prevent overflow propagation
+                x.abs().min(CLAMP_BOUND)
             }
             Self::Step => {
-                // step(+inf) = 1, step(-inf) = 0
-                if x > 0.0 || x == f32::INFINITY {
+                // Standard Heaviside step function: f(x) = 1 for x >= 0, f(x) = 0 for x < 0
+                // step(+inf) = 1, step(-inf) = 0, step(0) = 1
+                if x >= 0.0 {
                     1.0
                 } else {
                     0.0
                 }
             }
             Self::LeakyReLU => {
-                if x == f32::NEG_INFINITY {
-                    return f32::NEG_INFINITY; // 0.01 * -inf = -inf
-                }
-                if x > 0.0 {
-                    x
-                } else {
-                    0.01 * x
-                }
+                // Clamp to prevent overflow propagation
+                let result = if x > 0.0 { x } else { 0.01 * x };
+                result.clamp(-CLAMP_BOUND, CLAMP_BOUND)
             }
         }
     }
