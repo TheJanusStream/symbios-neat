@@ -253,7 +253,16 @@ impl NeatGenome {
     ///
     /// The original connection is disabled, and two new connections are created:
     /// input -> new_node (weight 1.0) and new_node -> output (original weight).
+    ///
+    /// Returns `None` if:
+    /// - The connection doesn't exist or is disabled
+    /// - No hidden activation functions are configured
     pub fn add_node<R: Rng>(&mut self, conn_id: ConnectionId, rng: &mut R) -> Option<NodeId> {
+        // Cannot add nodes if no hidden activations are configured
+        if self.config.hidden_activations.is_empty() {
+            return None;
+        }
+
         let conn = self.connections.get_mut(conn_id)?;
         if !conn.enabled {
             return None;
@@ -324,7 +333,10 @@ impl NeatGenome {
     }
 
     /// Update node depths for topological evaluation order.
-    pub fn update_depths(&mut self) {
+    ///
+    /// Returns `true` if the graph is acyclic and depths were computed successfully,
+    /// `false` if a cycle was detected (iteration limit exceeded).
+    pub fn update_depths(&mut self) -> bool {
         // Reset all depths
         for (_, node) in &mut self.nodes {
             node.depth = match node.node_type {
@@ -333,10 +345,17 @@ impl NeatGenome {
             };
         }
 
-        // Iteratively propagate depths until stable
+        // Iteratively propagate depths until stable.
+        // Limit iterations to prevent infinite loops on cyclic graphs.
+        // In an acyclic graph, we need at most N iterations (longest path length).
+        let max_iterations = self.nodes.len();
+        let mut iterations = 0;
         let mut changed = true;
-        while changed {
+
+        while changed && iterations < max_iterations {
             changed = false;
+            iterations += 1;
+
             for (_, conn) in &self.connections {
                 if !conn.enabled {
                     continue;
@@ -355,6 +374,95 @@ impl NeatGenome {
                 }
             }
         }
+
+        // If we're still changing after max iterations, there's a cycle
+        !changed
+    }
+
+    /// Check if the genome contains any cycles in its enabled connections.
+    #[must_use]
+    pub fn has_cycle(&self) -> bool {
+        // Use DFS with coloring: 0=white (unvisited), 1=gray (in progress), 2=black (done)
+        let mut node_to_idx: std::collections::HashMap<NodeId, usize> =
+            std::collections::HashMap::new();
+        for (i, (id, _)) in self.nodes.iter().enumerate() {
+            node_to_idx.insert(id, i);
+        }
+
+        // Build adjacency list for enabled connections
+        let mut adj: Vec<Vec<usize>> = vec![Vec::new(); self.nodes.len()];
+        for (_, conn) in &self.connections {
+            if !conn.enabled {
+                continue;
+            }
+            if let (Some(&from_idx), Some(&to_idx)) =
+                (node_to_idx.get(&conn.input), node_to_idx.get(&conn.output))
+            {
+                adj[from_idx].push(to_idx);
+            }
+        }
+
+        let mut color = vec![0u8; self.nodes.len()];
+
+        fn dfs(node: usize, adj: &[Vec<usize>], color: &mut [u8]) -> bool {
+            color[node] = 1; // Gray - in progress
+            for &neighbor in &adj[node] {
+                if color[neighbor] == 1 {
+                    // Back edge - cycle found
+                    return true;
+                }
+                if color[neighbor] == 0 && dfs(neighbor, adj, color) {
+                    return true;
+                }
+            }
+            color[node] = 2; // Black - done
+            false
+        }
+
+        for start in 0..self.nodes.len() {
+            if color[start] == 0 && dfs(start, &adj, &mut color) {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Remove connections that create cycles, keeping the graph acyclic.
+    /// Returns the number of connections disabled.
+    pub fn break_cycles(&mut self) -> usize {
+        let mut disabled_count = 0;
+
+        // Keep trying to find and break cycles until none remain
+        while self.has_cycle() {
+            // Find a connection that's part of a cycle and disable it
+            // We'll use the connection with the highest innovation number
+            // (most recently added) as a heuristic
+            let mut cycle_conn_id: Option<ConnectionId> = None;
+            let mut highest_inn = 0u64;
+
+            for (conn_id, conn) in &self.connections {
+                if !conn.enabled {
+                    continue;
+                }
+                // Check if disabling this connection would break a cycle
+                if conn.innovation >= highest_inn {
+                    highest_inn = conn.innovation;
+                    cycle_conn_id = Some(conn_id);
+                }
+            }
+
+            if let Some(conn_id) = cycle_conn_id {
+                if let Some(conn) = self.connections.get_mut(conn_id) {
+                    conn.enabled = false;
+                    disabled_count += 1;
+                }
+            } else {
+                break; // No more connections to disable
+            }
+        }
+
+        disabled_count
     }
 
     /// Get all hidden node IDs.
@@ -681,6 +789,13 @@ impl Genotype for NeatGenome {
             if advance_other {
                 other_idx += 1;
             }
+        }
+
+        // Detect and break any cycles that may have been introduced
+        // This can happen if innovation hash collisions cause non-homologous
+        // genes to be aligned and merged incorrectly
+        if child.has_cycle() {
+            child.break_cycles();
         }
 
         child.update_depths();

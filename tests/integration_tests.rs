@@ -8,6 +8,233 @@ use symbios_neat::{
     NeatConfig, NeatGenome, NodeType,
 };
 
+// =============================================================================
+// Bug Fix Regression Tests
+// =============================================================================
+
+/// Test that activation functions handle NaN consistently by propagating it.
+#[test]
+fn test_activation_nan_propagation() {
+    let nan = f32::NAN;
+
+    for activation in Activation::ALL {
+        let result = activation.apply(nan);
+        assert!(
+            result.is_nan(),
+            "Activation {:?} should propagate NaN, got {}",
+            activation,
+            result
+        );
+    }
+}
+
+/// Test that activation functions handle extreme values without overflow/panic.
+#[test]
+fn test_activation_extreme_values() {
+    let extreme_values = [
+        f32::MAX,
+        f32::MIN,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        1e38,
+        -1e38,
+        1e-38,
+        -1e-38,
+    ];
+
+    for activation in Activation::ALL {
+        for &value in &extreme_values {
+            let result = activation.apply(value);
+            // Result should be finite or a well-defined infinity, not NaN
+            assert!(
+                !result.is_nan(),
+                "Activation {:?} produced NaN for input {}, expected finite or infinite",
+                activation,
+                value
+            );
+        }
+    }
+}
+
+/// Test that update_depths doesn't infinite loop (has iteration limit).
+#[test]
+fn test_update_depths_terminates() {
+    let config = NeatConfig::minimal(2, 1);
+    let mut rng = ChaCha8Rng::seed_from_u64(42);
+    let mut genome = NeatGenome::fully_connected(config, &mut rng);
+
+    // Add many nodes to create a potentially deep network
+    for _ in 0..20 {
+        if let Some(conn_id) = genome
+            .connections
+            .iter()
+            .filter(|(_, c)| c.enabled)
+            .next()
+            .map(|(id, _)| id)
+        {
+            genome.add_node(conn_id, &mut rng);
+        }
+    }
+
+    // This should terminate quickly, not hang
+    let is_acyclic = genome.update_depths();
+    assert!(
+        is_acyclic,
+        "Genome should be acyclic after normal mutations"
+    );
+}
+
+/// Test that has_cycle correctly detects cycles.
+#[test]
+fn test_cycle_detection() {
+    let config = NeatConfig::minimal(2, 1);
+    let mut rng = ChaCha8Rng::seed_from_u64(42);
+    let genome = NeatGenome::fully_connected(config, &mut rng);
+
+    // A freshly created genome should not have cycles
+    assert!(!genome.has_cycle(), "Fresh genome should not have cycles");
+}
+
+/// Test that crossover produces acyclic offspring.
+#[test]
+fn test_crossover_acyclic() {
+    let config = NeatConfig::minimal(2, 1);
+    let mut rng = ChaCha8Rng::seed_from_u64(42);
+
+    // Create two parents with different structures
+    let mut parent1 = NeatGenome::fully_connected(config.clone(), &mut rng);
+    let mut parent2 = NeatGenome::fully_connected(config, &mut rng);
+
+    // Heavily mutate both parents
+    for _ in 0..20 {
+        parent1.mutate(&mut rng, 1.0);
+        parent2.mutate(&mut rng, 1.0);
+    }
+
+    // Perform crossover many times
+    for _ in 0..100 {
+        let child = parent1.crossover(&parent2, &mut rng);
+        assert!(
+            !child.has_cycle(),
+            "Crossover should not produce cyclic offspring"
+        );
+
+        // Verify the child can be evaluated without hanging
+        let mut evaluator = CppnEvaluator::new(&child);
+        let output = evaluator.evaluate(&[0.5, 0.5]);
+        assert!(output[0].is_finite(), "Child should produce finite output");
+    }
+}
+
+/// Test that add_node returns None when hidden_activations is empty.
+#[test]
+fn test_add_node_empty_activations() {
+    let config = NeatConfig {
+        hidden_activations: vec![], // Empty!
+        ..NeatConfig::minimal(2, 1)
+    };
+    let mut rng = ChaCha8Rng::seed_from_u64(42);
+    let mut genome = NeatGenome::fully_connected(config, &mut rng);
+
+    let conn_id = genome.connections.iter().next().unwrap().0;
+    let result = genome.add_node(conn_id, &mut rng);
+
+    assert!(
+        result.is_none(),
+        "add_node should return None when hidden_activations is empty"
+    );
+}
+
+/// Test that evaluate_into works correctly and matches evaluate.
+#[test]
+fn test_evaluate_into_matches_evaluate() {
+    let config = NeatConfig::cppn(3, 2);
+    let mut rng = ChaCha8Rng::seed_from_u64(42);
+    let mut genome = NeatGenome::fully_connected(config, &mut rng);
+
+    // Add some structure
+    for _ in 0..5 {
+        genome.mutate(&mut rng, 1.0);
+    }
+
+    let mut evaluator = CppnEvaluator::new(&genome);
+
+    let inputs = [0.5, -0.3, 0.8];
+    let outputs_vec = evaluator.evaluate(&inputs);
+
+    let mut outputs_buf = [0.0f32; 2];
+    evaluator.evaluate_into(&inputs, &mut outputs_buf);
+
+    assert!(
+        (outputs_vec[0] - outputs_buf[0]).abs() < 1e-6,
+        "evaluate and evaluate_into should produce same results"
+    );
+    assert!(
+        (outputs_vec[1] - outputs_buf[1]).abs() < 1e-6,
+        "evaluate and evaluate_into should produce same results"
+    );
+}
+
+/// Test that large-scale evolution doesn't crash or hang.
+#[test]
+fn test_large_scale_evolution_stability() {
+    let config = NeatConfig {
+        add_connection_prob: 0.3,
+        add_node_prob: 0.1,
+        ..NeatConfig::minimal(4, 2)
+    };
+    let mut rng = ChaCha8Rng::seed_from_u64(12345);
+
+    // Create population
+    let mut population: Vec<NeatGenome> = (0..50)
+        .map(|_| NeatGenome::fully_connected(config.clone(), &mut rng))
+        .collect();
+
+    // Run many generations
+    for generation in 0..20 {
+        // Mutate all
+        for genome in &mut population {
+            genome.mutate(&mut rng, 1.0);
+        }
+
+        // Crossover
+        let mut offspring = Vec::new();
+        for i in (0..population.len()).step_by(2) {
+            if i + 1 < population.len() {
+                let child = population[i].crossover(&population[i + 1], &mut rng);
+                offspring.push(child);
+            }
+        }
+        population.extend(offspring);
+
+        // Verify all genomes are valid
+        for (i, genome) in population.iter().enumerate() {
+            assert!(
+                !genome.has_cycle(),
+                "Generation {} genome {} has cycle",
+                generation,
+                i
+            );
+
+            let mut evaluator = CppnEvaluator::new(genome);
+            let output = evaluator.evaluate(&[0.1, 0.2, 0.3, 0.4]);
+            for (j, &val) in output.iter().enumerate() {
+                assert!(
+                    val.is_finite(),
+                    "Generation {} genome {} output {} is not finite: {}",
+                    generation,
+                    i,
+                    j,
+                    val
+                );
+            }
+        }
+
+        // Select
+        population.truncate(50);
+    }
+}
+
 #[test]
 fn test_full_evolution_cycle() {
     let config = NeatConfig::minimal(2, 1);

@@ -61,26 +61,90 @@ impl Activation {
     ];
 
     /// Apply this activation function to an input value.
+    ///
+    /// All activation functions propagate NaN consistently.
+    /// Extreme values (including infinity) are handled to produce finite outputs
+    /// where mathematically sensible, ensuring numerical stability.
     #[inline]
     #[must_use]
     pub fn apply(self, x: f32) -> f32 {
+        // Propagate NaN consistently across all activation functions
+        if x.is_nan() {
+            return f32::NAN;
+        }
+
         match self {
             Self::Identity => x,
-            Self::Sigmoid => 1.0 / (1.0 + (-x).exp()),
-            Self::Tanh => x.tanh(),
-            Self::ReLU => x.max(0.0),
-            Self::Sine => x.sin(),
-            Self::Cosine => x.cos(),
-            Self::Gaussian => (-x * x).exp(),
-            Self::Abs => x.abs(),
+            Self::Sigmoid => {
+                // Handle infinity: sigmoid(+inf) = 1, sigmoid(-inf) = 0
+                if x == f32::INFINITY {
+                    return 1.0;
+                }
+                if x == f32::NEG_INFINITY {
+                    return 0.0;
+                }
+                // Clamp to avoid overflow: sigmoid(-88) ≈ 0, sigmoid(88) ≈ 1
+                let clamped = x.clamp(-88.0, 88.0);
+                1.0 / (1.0 + (-clamped).exp())
+            }
+            Self::Tanh => {
+                // Handle infinity: tanh(+inf) = 1, tanh(-inf) = -1
+                if x == f32::INFINITY {
+                    return 1.0;
+                }
+                if x == f32::NEG_INFINITY {
+                    return -1.0;
+                }
+                x.tanh()
+            }
+            Self::ReLU => {
+                if x == f32::NEG_INFINITY {
+                    return 0.0;
+                }
+                x.max(0.0)
+            }
+            Self::Sine => {
+                // sin(infinity) is undefined; clamp to bounded range
+                if x.is_infinite() {
+                    return 0.0;
+                }
+                x.sin()
+            }
+            Self::Cosine => {
+                // cos(infinity) is undefined; clamp to bounded range
+                if x.is_infinite() {
+                    return 0.0;
+                }
+                x.cos()
+            }
+            Self::Gaussian => {
+                // gaussian(±inf) = 0
+                if x.is_infinite() {
+                    return 0.0;
+                }
+                // For |x| > 26, result is effectively 0 (exp(-676) ≈ 0)
+                if x.abs() > 26.0 {
+                    0.0
+                } else {
+                    (-x * x).exp()
+                }
+            }
+            Self::Abs => {
+                // abs(-inf) = +inf, abs(+inf) = +inf
+                x.abs()
+            }
             Self::Step => {
-                if x > 0.0 {
+                // step(+inf) = 1, step(-inf) = 0
+                if x > 0.0 || x == f32::INFINITY {
                     1.0
                 } else {
                     0.0
                 }
             }
             Self::LeakyReLU => {
+                if x == f32::NEG_INFINITY {
+                    return f32::NEG_INFINITY; // 0.01 * -inf = -inf
+                }
                 if x > 0.0 {
                     x
                 } else {

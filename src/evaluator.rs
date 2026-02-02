@@ -11,7 +11,8 @@ use crate::genome::NeatGenome;
 /// A compiled, evaluation-ready representation of a NEAT genome.
 ///
 /// The evaluator pre-computes topological order and organizes data for
-/// cache-efficient forward propagation.
+/// cache-efficient forward propagation. Uses adjacency lists for O(N+E)
+/// evaluation instead of O(N×E).
 #[derive(Debug, Clone)]
 pub struct CppnEvaluator {
     /// Node activations in topological order.
@@ -20,8 +21,9 @@ pub struct CppnEvaluator {
     biases: Vec<f32>,
     /// Activation function indices.
     activation_fns: Vec<crate::activation::Activation>,
-    /// Connections as `(from_idx, to_idx, weight, enabled)`.
-    connections: Vec<(usize, usize, f32, bool)>,
+    /// Adjacency list: for each node, a list of (from_idx, weight) for incoming connections.
+    /// This enables O(N+E) evaluation instead of O(N×E).
+    incoming: Vec<Vec<(usize, f32)>>,
     /// Indices of input nodes in the activations array.
     input_indices: Vec<usize>,
     /// Indices of output nodes in the activations array.
@@ -71,22 +73,25 @@ impl CppnEvaluator {
             }
         }
 
-        // Compile connections
-        let connections: Vec<_> = genome
-            .connections
-            .iter()
-            .filter_map(|(_, conn)| {
-                let from_idx = node_id_to_idx.get(&conn.input)?;
-                let to_idx = node_id_to_idx.get(&conn.output)?;
-                Some((*from_idx, *to_idx, conn.weight, conn.enabled))
-            })
-            .collect();
+        // Build adjacency list: incoming connections for each node
+        let mut incoming: Vec<Vec<(usize, f32)>> = vec![Vec::new(); activations.len()];
+        for (_, conn) in &genome.connections {
+            if !conn.enabled {
+                continue;
+            }
+            if let (Some(&from_idx), Some(&to_idx)) = (
+                node_id_to_idx.get(&conn.input),
+                node_id_to_idx.get(&conn.output),
+            ) {
+                incoming[to_idx].push((from_idx, conn.weight));
+            }
+        }
 
         Self {
             activations,
             biases,
             activation_fns,
-            connections,
+            incoming,
             input_indices,
             output_indices,
             bias_index,
@@ -94,26 +99,32 @@ impl CppnEvaluator {
         }
     }
 
-    /// Evaluate the network with given inputs.
+    /// Evaluate the network with given inputs, writing results to a provided buffer.
+    ///
+    /// This is the allocation-free version for hot paths like CPPN pattern generation.
     ///
     /// # Arguments
     ///
     /// * `inputs` - Input values. Must match the number of input nodes.
-    ///
-    /// # Returns
-    ///
-    /// Output values from the network.
+    /// * `outputs` - Buffer to write output values. Must match the number of output nodes.
     ///
     /// # Panics
     ///
-    /// Panics if input length doesn't match the number of input nodes.
-    pub fn evaluate(&mut self, inputs: &[f32]) -> Vec<f32> {
+    /// Panics if input or output length doesn't match the network configuration.
+    pub fn evaluate_into(&mut self, inputs: &[f32], outputs: &mut [f32]) {
         assert_eq!(
             inputs.len(),
             self.input_indices.len(),
             "Input length mismatch: expected {}, got {}",
             self.input_indices.len(),
             inputs.len()
+        );
+        assert_eq!(
+            outputs.len(),
+            self.output_indices.len(),
+            "Output length mismatch: expected {}, got {}",
+            self.output_indices.len(),
+            outputs.len()
         );
 
         // Reset activations
@@ -131,25 +142,41 @@ impl CppnEvaluator {
             self.activations[bias_idx] = 1.0;
         }
 
-        // Forward propagation in topological order
+        // Forward propagation in topological order - O(N+E) using adjacency list
         for &node_idx in &self.eval_order {
-            // Sum incoming connections
+            // Sum incoming connections from adjacency list
             let mut sum = self.biases[node_idx];
-            for &(from_idx, to_idx, weight, enabled) in &self.connections {
-                if enabled && to_idx == node_idx {
-                    sum += self.activations[from_idx] * weight;
-                }
+            for &(from_idx, weight) in &self.incoming[node_idx] {
+                sum += self.activations[from_idx] * weight;
             }
 
             // Apply activation function
             self.activations[node_idx] = self.activation_fns[node_idx].apply(sum);
         }
 
-        // Collect outputs
-        self.output_indices
-            .iter()
-            .map(|&idx| self.activations[idx])
-            .collect()
+        // Write outputs to buffer
+        for (i, &idx) in self.output_indices.iter().enumerate() {
+            outputs[i] = self.activations[idx];
+        }
+    }
+
+    /// Evaluate the network with given inputs.
+    ///
+    /// # Arguments
+    ///
+    /// * `inputs` - Input values. Must match the number of input nodes.
+    ///
+    /// # Returns
+    ///
+    /// Output values from the network.
+    ///
+    /// # Panics
+    ///
+    /// Panics if input length doesn't match the number of input nodes.
+    pub fn evaluate(&mut self, inputs: &[f32]) -> Vec<f32> {
+        let mut outputs = vec![0.0; self.output_indices.len()];
+        self.evaluate_into(inputs, &mut outputs);
+        outputs
     }
 
     /// Query the CPPN with 2D coordinates.
@@ -225,13 +252,17 @@ pub fn generate_pattern(
     let width_f = width as f32;
     let height_f = height as f32;
 
+    // Pre-allocate buffers for allocation-free inner loop
+    let mut inputs = [0.0f32; 2];
+    let mut outputs = vec![0.0f32; evaluator.num_outputs()];
+
     for y in 0..height {
         for x in 0..width {
             // Normalize coordinates to [-1, 1]
-            let nx = (x as f32 / width_f).mul_add(2.0, -1.0);
-            let ny = (y as f32 / height_f).mul_add(2.0, -1.0);
+            inputs[0] = (x as f32 / width_f).mul_add(2.0, -1.0);
+            inputs[1] = (y as f32 / height_f).mul_add(2.0, -1.0);
 
-            let outputs = evaluator.query_2d(nx, ny);
+            evaluator.evaluate_into(&inputs, &mut outputs);
             let value = outputs.get(output_index).copied().unwrap_or(0.0);
 
             // Normalize output to [0, 1]
