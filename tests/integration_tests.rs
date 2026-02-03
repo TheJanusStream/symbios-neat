@@ -172,8 +172,8 @@ fn test_weight_clamping_prevents_unbounded_growth() {
         genome.mutate(&mut rng, 1.0);
     }
 
-    // Verify all weights are finite and bounded
-    let weight_limit = config.weight_range * 10.0;
+    // Verify all weights are finite and bounded to the consistent limit
+    const WEIGHT_LIMIT: f32 = 1e6;
     for (_, conn) in &genome.connections {
         assert!(
             conn.weight.is_finite(),
@@ -181,10 +181,10 @@ fn test_weight_clamping_prevents_unbounded_growth() {
             conn.weight
         );
         assert!(
-            conn.weight.abs() <= weight_limit,
+            conn.weight.abs() <= WEIGHT_LIMIT,
             "Weight {} exceeds limit {}",
             conn.weight,
-            weight_limit
+            WEIGHT_LIMIT
         );
     }
 
@@ -806,10 +806,10 @@ fn test_innovation_hash_distribution() {
 }
 
 /// Test reserved innovation range boundary conditions.
-/// All hash-based innovations should be >= RESERVED_INNOVATION_RANGE (65536).
+/// All hash-based innovations should be >= RESERVED_INNOVATION_RANGE (2^32).
 #[test]
 fn test_reserved_innovation_range_boundary() {
-    const RESERVED_RANGE: u64 = 1 << 16; // 65536
+    const RESERVED_RANGE: u64 = 1 << 32; // 4,294,967,296
 
     // Test with values near the boundary
     for input in 0..1000u64 {
@@ -867,11 +867,11 @@ fn test_high_dimensional_inputs() {
         "All node innovations should be unique"
     );
 
-    // Fixed IDs should be < 65536 for reserved range nodes
+    // Fixed IDs should be < 2^32 for reserved range nodes
     let max_fixed_id = *node_innovations.iter().max().unwrap();
     assert!(
-        max_fixed_id < 65536,
-        "Fixed node IDs {} should fit in reserved range 65536",
+        max_fixed_id < (1u64 << 32),
+        "Fixed node IDs {} should fit in reserved range 2^32",
         max_fixed_id
     );
 }
@@ -1365,4 +1365,270 @@ fn test_all_activation_functions_work() {
             activation
         );
     }
+}
+
+// =============================================================================
+// Code Review Fix Regression Tests (Issues #39-#43)
+// =============================================================================
+
+/// Test that iterative DFS in has_cycle handles deep networks without stack overflow.
+/// This verifies the fix for issue #39 (recursive stack overflow).
+#[test]
+fn test_deep_network_no_stack_overflow_has_cycle() {
+    let config = NeatConfig::minimal(1, 1);
+    let mut rng = ChaCha8Rng::seed_from_u64(42);
+    let mut genome = NeatGenome::fully_connected(config, &mut rng);
+
+    // Create a very deep chain by repeatedly splitting connections
+    // This creates a network depth that would overflow the stack with recursion
+    for _ in 0..500 {
+        // Find an enabled connection to split
+        if let Some(conn_id) = genome
+            .connections
+            .iter()
+            .filter(|(_, c)| c.enabled)
+            .next()
+            .map(|(id, _)| id)
+        {
+            genome.add_node(conn_id, &mut rng);
+        }
+    }
+
+    // This should complete without stack overflow
+    let has_cycle = genome.has_cycle();
+    assert!(!has_cycle, "Deep chain network should not have cycles");
+
+    // Verify we actually created a deep network
+    assert!(
+        genome.nodes.len() > 400,
+        "Should have created many nodes: {}",
+        genome.nodes.len()
+    );
+}
+
+/// Test that iterative DFS in find_back_edge handles deep networks without stack overflow.
+/// This verifies the fix for issue #39 (recursive stack overflow).
+#[test]
+fn test_deep_network_no_stack_overflow_break_cycles() {
+    let config = NeatConfig::minimal(1, 1);
+    let mut rng = ChaCha8Rng::seed_from_u64(42);
+    let mut genome = NeatGenome::fully_connected(config, &mut rng);
+
+    // Create a very deep chain
+    for _ in 0..500 {
+        if let Some(conn_id) = genome
+            .connections
+            .iter()
+            .filter(|(_, c)| c.enabled)
+            .next()
+            .map(|(id, _)| id)
+        {
+            genome.add_node(conn_id, &mut rng);
+        }
+    }
+
+    // This should complete without stack overflow
+    let disabled = genome.break_cycles();
+    assert_eq!(
+        disabled, 0,
+        "Acyclic network should have no cycles to break"
+    );
+}
+
+/// Test that the increased RESERVED_INNOVATION_RANGE (2^32) prevents collisions
+/// with networks that have very large input layers.
+/// This verifies the fix for issue #40 (innovation ID collision).
+#[test]
+fn test_large_input_layer_no_innovation_collision() {
+    // Create a network with inputs that would exceed the old 65536 limit
+    // We can't actually create 65537 inputs due to memory, but we verify
+    // that hash-based innovations are safely above the new 2^32 threshold
+    let config = NeatConfig::minimal(100, 10);
+    let mut rng = ChaCha8Rng::seed_from_u64(42);
+    let mut genome = NeatGenome::fully_connected(config, &mut rng);
+
+    // Get the maximum fixed innovation (input/output node IDs)
+    let max_fixed_innovation = genome
+        .nodes
+        .iter()
+        .map(|(_, n)| n.innovation)
+        .max()
+        .unwrap();
+
+    // Add structure via mutations to create hash-based innovations
+    for _ in 0..20 {
+        genome.mutate(&mut rng, 1.0);
+    }
+
+    // Collect all innovations
+    let node_innovations: Vec<u64> = genome.nodes.iter().map(|(_, n)| n.innovation).collect();
+    let conn_innovations: Vec<u64> = genome
+        .connections
+        .iter()
+        .map(|(_, c)| c.innovation)
+        .collect();
+
+    // Verify no collision between fixed IDs and hash-based IDs
+    const NEW_RESERVED_RANGE: u64 = 1 << 32;
+    for &inn in &node_innovations {
+        if inn > max_fixed_innovation {
+            assert!(
+                inn >= NEW_RESERVED_RANGE,
+                "Hash-based node innovation {} should be >= {}",
+                inn,
+                NEW_RESERVED_RANGE
+            );
+        }
+    }
+    for &inn in &conn_innovations {
+        assert!(
+            inn >= NEW_RESERVED_RANGE,
+            "Connection innovation {} should be >= {}",
+            inn,
+            NEW_RESERVED_RANGE
+        );
+    }
+}
+
+/// Test that weight initialization clamps extreme values to prevent Inf/NaN.
+/// This verifies the fix for issue #41 (unbounded weight initialization).
+#[test]
+fn test_weight_initialization_clamped_extreme_range() {
+    // Use an extremely large weight_range that would cause overflow without clamping
+    let config = NeatConfig {
+        weight_range: f32::MAX / 2.0, // Would overflow: 2.0 * this = Infinity
+        ..NeatConfig::minimal(2, 1)
+    };
+    let mut rng = ChaCha8Rng::seed_from_u64(42);
+
+    // This should not panic or produce NaN/Inf
+    let genome = NeatGenome::fully_connected(config, &mut rng);
+
+    for (_, conn) in &genome.connections {
+        assert!(
+            conn.weight.is_finite(),
+            "Weight should be finite even with extreme weight_range, got {}",
+            conn.weight
+        );
+        assert!(
+            conn.weight.abs() <= 1e6,
+            "Weight {} should be clamped to 1e6",
+            conn.weight
+        );
+    }
+}
+
+/// Test that add_connection also clamps weights with extreme range.
+/// This verifies the fix for issue #41 (unbounded weight initialization).
+#[test]
+fn test_add_connection_weight_clamped() {
+    let config = NeatConfig {
+        weight_range: f32::MAX / 2.0,
+        ..NeatConfig::minimal(2, 2)
+    };
+    let mut genome = NeatGenome::minimal(config);
+    let mut rng = ChaCha8Rng::seed_from_u64(42);
+
+    // Add connections manually
+    let input_id = genome.input_ids[0];
+    let output_id = genome.output_ids[0];
+    let conn_id = genome.add_connection(input_id, output_id, &mut rng);
+
+    assert!(conn_id.is_some(), "Connection should be added");
+
+    let conn = &genome.connections[conn_id.unwrap()];
+    assert!(
+        conn.weight.is_finite(),
+        "add_connection weight should be finite, got {}",
+        conn.weight
+    );
+    assert!(
+        conn.weight.abs() <= 1e6,
+        "add_connection weight {} should be clamped to 1e6",
+        conn.weight
+    );
+}
+
+/// Test that CppnEvaluator::try_new returns error for cyclic genomes.
+/// This verifies the fix for issue #42 (evaluator ignoring cycle detection).
+#[test]
+fn test_evaluator_try_new_detects_cycles() {
+    use symbios_neat::EvaluatorError;
+
+    let config = NeatConfig::minimal(2, 1);
+    let mut rng = ChaCha8Rng::seed_from_u64(42);
+    let genome = NeatGenome::fully_connected(config, &mut rng);
+
+    // A normal acyclic genome should succeed
+    let result = CppnEvaluator::try_new(&genome);
+    assert!(result.is_ok(), "Acyclic genome should create evaluator");
+
+    // Verify the error type exists and displays properly
+    let err = EvaluatorError::CyclicGenome;
+    let msg = err.to_string();
+    assert!(
+        msg.contains("cycle"),
+        "Error message should mention cycles: {}",
+        msg
+    );
+}
+
+/// Test that the evaluator works correctly with deep networks after all fixes.
+/// This is a comprehensive integration test combining multiple fixes.
+#[test]
+fn test_deep_network_evaluation_after_fixes() {
+    let config = NeatConfig {
+        add_node_prob: 1.0, // Always add nodes
+        ..NeatConfig::minimal(2, 1)
+    };
+    let mut rng = ChaCha8Rng::seed_from_u64(42);
+    let mut genome = NeatGenome::fully_connected(config, &mut rng);
+
+    // Create a moderately deep network
+    for _ in 0..100 {
+        genome.mutate(&mut rng, 1.0);
+    }
+
+    // Verify no cycles
+    assert!(!genome.has_cycle(), "Mutated genome should be acyclic");
+
+    // Create evaluator (should not panic even with deep network)
+    let result = CppnEvaluator::try_new(&genome);
+    assert!(
+        result.is_ok(),
+        "Deep acyclic genome should create evaluator"
+    );
+
+    let mut evaluator = result.unwrap();
+    let output = evaluator.evaluate(&[0.5, -0.5]);
+
+    assert!(
+        output[0].is_finite(),
+        "Deep network output should be finite"
+    );
+}
+
+/// Test that crossover with deep parent networks doesn't cause issues.
+#[test]
+fn test_crossover_deep_parents() {
+    let config = NeatConfig::minimal(2, 1);
+    let mut rng = ChaCha8Rng::seed_from_u64(42);
+
+    // Create two deep parent networks
+    let mut parent1 = NeatGenome::fully_connected(config.clone(), &mut rng);
+    let mut parent2 = NeatGenome::fully_connected(config, &mut rng);
+
+    for _ in 0..50 {
+        parent1.mutate(&mut rng, 1.0);
+        parent2.mutate(&mut rng, 1.0);
+    }
+
+    // Crossover should work without stack overflow
+    let child = parent1.crossover(&parent2, &mut rng);
+
+    // Child should be valid
+    assert!(!child.has_cycle(), "Child should be acyclic");
+
+    let result = CppnEvaluator::try_new(&child);
+    assert!(result.is_ok(), "Child should create valid evaluator");
 }

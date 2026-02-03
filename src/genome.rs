@@ -165,6 +165,22 @@ impl NeatGenome {
         }
     }
 
+    /// Generate a random weight in [-weight_range, weight_range], clamped to safe bounds.
+    ///
+    /// This prevents overflow when `weight_range` is very large (e.g., near `f32::MAX`).
+    /// The calculation `2.0 * weight_range` can overflow to infinity, and `inf - inf`
+    /// produces NaN. This method clamps the result to a safe range.
+    fn random_weight<R: Rng>(rng: &mut R, weight_range: f32) -> f32 {
+        // Use mul_add for better numerical stability: random * 2 * range - range
+        // This is equivalent to: random * 2 * range - range = range * (2 * random - 1)
+        let raw = rng.random::<f32>().mul_add(2.0, -1.0) * weight_range;
+
+        // Clamp to a safe range to prevent Inf/NaN propagation
+        // Use 1e6 as the absolute limit (same as Identity activation clamping)
+        const WEIGHT_LIMIT: f32 = 1e6;
+        raw.clamp(-WEIGHT_LIMIT, WEIGHT_LIMIT)
+    }
+
     /// Create a fully-connected genome (all inputs connected to all outputs).
     #[must_use]
     pub fn fully_connected<R: Rng>(config: NeatConfig, rng: &mut R) -> Self {
@@ -176,7 +192,7 @@ impl NeatGenome {
                 let input_inn = genome.nodes[input_id].innovation;
                 let output_inn = genome.nodes[output_id].innovation;
                 let conn_inn = connection_innovation(input_inn, output_inn);
-                let weight = rng.random::<f32>() * 2.0 * config.weight_range - config.weight_range;
+                let weight = Self::random_weight(rng, config.weight_range);
                 genome
                     .connections
                     .insert(ConnectionGene::new(conn_inn, input_id, output_id, weight));
@@ -189,7 +205,7 @@ impl NeatGenome {
                 let bias_inn = genome.nodes[bias_id].innovation;
                 let output_inn = genome.nodes[output_id].innovation;
                 let conn_inn = connection_innovation(bias_inn, output_inn);
-                let weight = rng.random::<f32>() * 2.0 * config.weight_range - config.weight_range;
+                let weight = Self::random_weight(rng, config.weight_range);
                 genome
                     .connections
                     .insert(ConnectionGene::new(conn_inn, bias_id, output_id, weight));
@@ -239,9 +255,8 @@ impl NeatGenome {
             return None;
         }
 
-        // Create the connection
-        let weight =
-            rng.random::<f32>() * 2.0 * self.config.weight_range - self.config.weight_range;
+        // Create the connection with clamped weight to prevent Inf/NaN
+        let weight = Self::random_weight(rng, self.config.weight_range);
         let conn = ConnectionGene::new(conn_inn, input_id, output_id, weight);
         let conn_id = self.connections.insert(conn);
 
@@ -380,6 +395,8 @@ impl NeatGenome {
     }
 
     /// Check if the genome contains any cycles in its enabled connections.
+    ///
+    /// Uses iterative DFS with explicit stack to avoid stack overflow on deep networks.
     #[must_use]
     pub fn has_cycle(&self) -> bool {
         // Use DFS with coloring: 0=white (unvisited), 1=gray (in progress), 2=black (done)
@@ -404,24 +421,45 @@ impl NeatGenome {
 
         let mut color = vec![0u8; self.nodes.len()];
 
-        fn dfs(node: usize, adj: &[Vec<usize>], color: &mut [u8]) -> bool {
-            color[node] = 1; // Gray - in progress
-            for &neighbor in &adj[node] {
-                if color[neighbor] == 1 {
-                    // Back edge - cycle found
-                    return true;
-                }
-                if color[neighbor] == 0 && dfs(neighbor, adj, color) {
-                    return true;
-                }
-            }
-            color[node] = 2; // Black - done
-            false
-        }
+        // Iterative DFS using explicit stack to avoid stack overflow on deep networks
+        // Stack entries: (node, neighbor_index, is_entering)
+        // is_entering=true means we're entering the node for the first time
+        let mut stack: Vec<(usize, usize, bool)> = Vec::with_capacity(self.nodes.len());
 
         for start in 0..self.nodes.len() {
-            if color[start] == 0 && dfs(start, &adj, &mut color) {
-                return true;
+            if color[start] != 0 {
+                continue;
+            }
+
+            stack.push((start, 0, true));
+
+            while let Some((node, neighbor_idx, is_entering)) = stack.pop() {
+                if is_entering {
+                    color[node] = 1; // Gray - in current DFS path
+                }
+
+                // Process neighbors starting from neighbor_idx
+                let mut found_unvisited = false;
+                let neighbors = &adj[node];
+                for (offset, &neighbor) in neighbors.iter().enumerate().skip(neighbor_idx) {
+                    if color[neighbor] == 1 {
+                        // Back edge - cycle found
+                        return true;
+                    }
+                    if color[neighbor] == 0 {
+                        // Push current node back with next neighbor index
+                        stack.push((node, neighbor_idx + offset + 1, false));
+                        // Push neighbor to visit
+                        stack.push((neighbor, 0, true));
+                        found_unvisited = true;
+                        break;
+                    }
+                }
+
+                if !found_unvisited {
+                    // All neighbors processed, mark node as done
+                    color[node] = 2; // Black - done
+                }
             }
         }
 
@@ -454,14 +492,14 @@ impl NeatGenome {
     ///
     /// Returns the ConnectionId of the back edge with the lowest absolute weight
     /// among all back edges found, to minimize signal disruption when breaking cycles.
+    ///
+    /// Uses iterative DFS with explicit stack to avoid stack overflow on deep networks.
     fn find_back_edge(&self) -> Option<ConnectionId> {
         // Build node index mapping
         let mut node_to_idx: std::collections::HashMap<NodeId, usize> =
             std::collections::HashMap::new();
-        let mut idx_to_node: Vec<NodeId> = Vec::new();
-        for (id, _) in &self.nodes {
-            node_to_idx.insert(id, idx_to_node.len());
-            idx_to_node.push(id);
+        for (i, (id, _)) in self.nodes.iter().enumerate() {
+            node_to_idx.insert(id, i);
         }
 
         // Build adjacency list with connection IDs
@@ -482,27 +520,45 @@ impl NeatGenome {
         let mut color = vec![0u8; self.nodes.len()];
         let mut back_edges: Vec<ConnectionId> = Vec::new();
 
-        fn dfs(
-            node: usize,
-            adj: &[Vec<(usize, ConnectionId)>],
-            color: &mut [u8],
-            back_edges: &mut Vec<ConnectionId>,
-        ) {
-            color[node] = 1; // Gray - in current DFS path
-            for &(neighbor, conn_id) in &adj[node] {
-                if color[neighbor] == 1 {
-                    // Back edge found - neighbor is an ancestor in current path
-                    back_edges.push(conn_id);
-                } else if color[neighbor] == 0 {
-                    dfs(neighbor, adj, color, back_edges);
-                }
-            }
-            color[node] = 2; // Black - done
-        }
+        // Iterative DFS using explicit stack to avoid stack overflow on deep networks
+        // Stack entries: (node, neighbor_index, is_entering)
+        let mut stack: Vec<(usize, usize, bool)> = Vec::with_capacity(self.nodes.len());
 
         for start in 0..self.nodes.len() {
-            if color[start] == 0 {
-                dfs(start, &adj, &mut color, &mut back_edges);
+            if color[start] != 0 {
+                continue;
+            }
+
+            stack.push((start, 0, true));
+
+            while let Some((node, neighbor_idx, is_entering)) = stack.pop() {
+                if is_entering {
+                    color[node] = 1; // Gray - in current DFS path
+                }
+
+                // Process neighbors starting from neighbor_idx
+                let mut found_unvisited = false;
+                let neighbors = &adj[node];
+                for (offset, &(neighbor, conn_id)) in
+                    neighbors.iter().enumerate().skip(neighbor_idx)
+                {
+                    if color[neighbor] == 1 {
+                        // Back edge found - neighbor is an ancestor in current path
+                        back_edges.push(conn_id);
+                    } else if color[neighbor] == 0 {
+                        // Push current node back with next neighbor index
+                        stack.push((node, neighbor_idx + offset + 1, false));
+                        // Push neighbor to visit
+                        stack.push((neighbor, 0, true));
+                        found_unvisited = true;
+                        break;
+                    }
+                }
+
+                if !found_unvisited {
+                    // All neighbors processed, mark node as done
+                    color[node] = 2; // Black - done
+                }
             }
         }
 
@@ -625,23 +681,21 @@ impl NeatGenome {
 
     /// Mutate weights of existing connections.
     fn mutate_weights<R: Rng>(&mut self, rng: &mut R) {
-        // Clamp weights to prevent unbounded growth that leads to Inf/NaN
-        // in compatibility_distance calculations (Inf - Inf = NaN causes panics)
-        let weight_limit = self.config.weight_range * 10.0;
+        // Use same weight limit as random_weight for consistency
+        const WEIGHT_LIMIT: f32 = 1e6;
 
         for (_, conn) in &mut self.connections {
             if rng.random::<f32>() < self.config.weight_mutation_prob {
                 if rng.random::<f32>() < self.config.weight_replace_prob {
-                    // Replace with new random weight
-                    conn.weight = rng.random::<f32>() * 2.0 * self.config.weight_range
-                        - self.config.weight_range;
+                    // Replace with new random weight (using helper for safe generation)
+                    conn.weight = Self::random_weight(rng, self.config.weight_range);
                 } else {
                     // Perturb existing weight
                     conn.weight +=
                         (rng.random::<f32>() * 2.0 - 1.0) * self.config.weight_mutation_power;
                 }
                 // Clamp to prevent unbounded growth
-                conn.weight = conn.weight.clamp(-weight_limit, weight_limit);
+                conn.weight = conn.weight.clamp(-WEIGHT_LIMIT, WEIGHT_LIMIT);
             }
         }
     }

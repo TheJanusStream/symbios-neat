@@ -15,7 +15,10 @@ const SPLIT_MARKER: u64 = 0xDEAD_BEEF_CAFE_BABE;
 
 /// Reserved range for fixed innovation IDs (bias, input, output nodes).
 /// Hash-based innovations will always be >= this value.
-const RESERVED_INNOVATION_RANGE: u64 = 1 << 16; // 65536
+///
+/// Set to 2^32 to support networks with up to ~4 billion input/output nodes
+/// without risking collision between fixed node IDs and hash-based innovations.
+const RESERVED_INNOVATION_RANGE: u64 = 1 << 32; // 4,294,967,296
 
 /// A deterministic hasher for computing innovation numbers.
 ///

@@ -34,18 +34,64 @@ pub struct CppnEvaluator {
     eval_order: Vec<usize>,
 }
 
+/// Error type for evaluator construction failures.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EvaluatorError {
+    /// The genome contains cycles in its enabled connections.
+    ///
+    /// Feedforward evaluation requires an acyclic graph. Use `NeatGenome::break_cycles()`
+    /// or `NeatGenome::has_cycle()` to detect and fix cycles before creating an evaluator.
+    CyclicGenome,
+}
+
+impl std::fmt::Display for EvaluatorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EvaluatorError::CyclicGenome => {
+                write!(
+                    f,
+                    "genome contains cycles; feedforward evaluation requires an acyclic graph"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for EvaluatorError {}
+
 impl CppnEvaluator {
     /// Compile a NEAT genome into an efficient evaluator.
     ///
     /// This method ensures depth consistency by recomputing depths before
     /// building the evaluator. This guarantees correct evaluation order even
     /// if the genome was modified without calling `update_depths()`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the genome contains cycles. Use [`try_new`](Self::try_new) for
+    /// non-panicking construction, or [`NeatGenome::break_cycles`] to fix the genome first.
     #[must_use]
     pub fn new(genome: &NeatGenome) -> Self {
+        Self::try_new(genome).expect("genome contains cycles; use try_new() or break_cycles()")
+    }
+
+    /// Try to compile a NEAT genome into an efficient evaluator.
+    ///
+    /// Returns an error if the genome contains cycles, which would make feedforward
+    /// evaluation mathematically undefined.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EvaluatorError::CyclicGenome`] if the genome contains cycles.
+    pub fn try_new(genome: &NeatGenome) -> Result<Self, EvaluatorError> {
         // Clone and ensure depths are consistent before building evaluator
         // This prevents silent numerical errors from stale depth values
         let mut genome_copy = genome.clone();
-        genome_copy.update_depths();
+        let is_acyclic = genome_copy.update_depths();
+
+        if !is_acyclic {
+            return Err(EvaluatorError::CyclicGenome);
+        }
 
         // Create mapping from NodeId to dense index
         let mut node_id_to_idx: std::collections::HashMap<NodeId, usize> =
@@ -110,7 +156,7 @@ impl CppnEvaluator {
             }
         }
 
-        Self {
+        Ok(Self {
             activations,
             biases,
             activation_fns,
@@ -119,7 +165,7 @@ impl CppnEvaluator {
             output_indices,
             bias_index,
             eval_order,
-        }
+        })
     }
 
     /// Evaluate the network with given inputs, writing results to a provided buffer.
@@ -449,5 +495,26 @@ mod tests {
 
         let mut evaluator = CppnEvaluator::new(&genome);
         evaluator.evaluate(&[1.0]); // Wrong number of inputs
+    }
+
+    #[test]
+    fn test_try_new_returns_ok_for_acyclic_genome() {
+        let config = NeatConfig::minimal(2, 1);
+        let mut rng = test_rng();
+        let genome = NeatGenome::fully_connected(config, &mut rng);
+
+        let result = CppnEvaluator::try_new(&genome);
+        assert!(result.is_ok(), "try_new should succeed for acyclic genome");
+    }
+
+    #[test]
+    fn test_evaluator_error_display() {
+        let err = EvaluatorError::CyclicGenome;
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cycle"),
+            "Error message should mention cycles: {}",
+            msg
+        );
     }
 }
