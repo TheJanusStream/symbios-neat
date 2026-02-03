@@ -767,6 +767,11 @@ impl Genotype for NeatGenome {
         self.mutate_toggle_enabled(rng);
         self.mutate_add_connection_with_prob(rng, scaled_add_conn_prob);
         self.mutate_add_node_with_prob(rng, scaled_add_node_prob);
+
+        if self.has_cycle() {
+            self.break_cycles();
+        }
+        self.update_depths();
     }
 
     fn crossover<R: Rng>(&self, other: &Self, rng: &mut R) -> Self {
