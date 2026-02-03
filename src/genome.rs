@@ -301,12 +301,12 @@ impl NeatGenome {
 
     /// Check if adding a connection from input_id to output_id would create a cycle.
     fn would_create_cycle(&self, input_id: NodeId, output_id: NodeId) -> bool {
-        // BFS from output_id to see if we can reach input_id
-        // Use HashSet directly instead of mapping NodeId to index
+        // DFS from output_id to see if we can reach input_id
+        // (Using stack with pop() for LIFO traversal)
         let mut visited = std::collections::HashSet::with_capacity(self.nodes.len());
-        let mut queue = vec![output_id];
+        let mut stack = vec![output_id];
 
-        while let Some(current) = queue.pop() {
+        while let Some(current) = stack.pop() {
             if current == input_id {
                 return true;
             }
@@ -318,7 +318,7 @@ impl NeatGenome {
             // Find all nodes that current connects TO
             for (_, conn) in &self.connections {
                 if conn.enabled && conn.input == current {
-                    queue.push(conn.output);
+                    stack.push(conn.output);
                 }
             }
         }
@@ -429,40 +429,103 @@ impl NeatGenome {
     }
 
     /// Remove connections that create cycles, keeping the graph acyclic.
+    ///
+    /// Uses DFS to find actual back edges (edges that close cycles), then
+    /// disables the back edge with the lowest absolute weight to minimize
+    /// signal disruption. This is more targeted than disabling arbitrary
+    /// high-innovation connections.
+    ///
     /// Returns the number of connections disabled.
     pub fn break_cycles(&mut self) -> usize {
         let mut disabled_count = 0;
 
         // Keep trying to find and break cycles until none remain
-        while self.has_cycle() {
-            // Find a connection that's part of a cycle and disable it
-            // We'll use the connection with the highest innovation number
-            // (most recently added) as a heuristic
-            let mut cycle_conn_id: Option<ConnectionId> = None;
-            let mut highest_inn = 0u64;
-
-            for (conn_id, conn) in &self.connections {
-                if !conn.enabled {
-                    continue;
-                }
-                // Check if disabling this connection would break a cycle
-                if conn.innovation >= highest_inn {
-                    highest_inn = conn.innovation;
-                    cycle_conn_id = Some(conn_id);
-                }
-            }
-
-            if let Some(conn_id) = cycle_conn_id {
-                if let Some(conn) = self.connections.get_mut(conn_id) {
-                    conn.enabled = false;
-                    disabled_count += 1;
-                }
-            } else {
-                break; // No more connections to disable
+        while let Some(back_edge_id) = self.find_back_edge() {
+            if let Some(conn) = self.connections.get_mut(back_edge_id) {
+                conn.enabled = false;
+                disabled_count += 1;
             }
         }
 
         disabled_count
+    }
+
+    /// Find a back edge (an edge that creates a cycle) using DFS.
+    ///
+    /// Returns the ConnectionId of the back edge with the lowest absolute weight
+    /// among all back edges found, to minimize signal disruption when breaking cycles.
+    fn find_back_edge(&self) -> Option<ConnectionId> {
+        // Build node index mapping
+        let mut node_to_idx: std::collections::HashMap<NodeId, usize> =
+            std::collections::HashMap::new();
+        let mut idx_to_node: Vec<NodeId> = Vec::new();
+        for (id, _) in &self.nodes {
+            node_to_idx.insert(id, idx_to_node.len());
+            idx_to_node.push(id);
+        }
+
+        // Build adjacency list with connection IDs
+        let mut adj: Vec<Vec<(usize, ConnectionId)>> = vec![Vec::new(); self.nodes.len()];
+        for (conn_id, conn) in &self.connections {
+            if !conn.enabled {
+                continue;
+            }
+            if let (Some(&from_idx), Some(&to_idx)) =
+                (node_to_idx.get(&conn.input), node_to_idx.get(&conn.output))
+            {
+                adj[from_idx].push((to_idx, conn_id));
+            }
+        }
+
+        // DFS to find back edges
+        // Color: 0=white (unvisited), 1=gray (in progress), 2=black (done)
+        let mut color = vec![0u8; self.nodes.len()];
+        let mut back_edges: Vec<ConnectionId> = Vec::new();
+
+        fn dfs(
+            node: usize,
+            adj: &[Vec<(usize, ConnectionId)>],
+            color: &mut [u8],
+            back_edges: &mut Vec<ConnectionId>,
+        ) {
+            color[node] = 1; // Gray - in current DFS path
+            for &(neighbor, conn_id) in &adj[node] {
+                if color[neighbor] == 1 {
+                    // Back edge found - neighbor is an ancestor in current path
+                    back_edges.push(conn_id);
+                } else if color[neighbor] == 0 {
+                    dfs(neighbor, adj, color, back_edges);
+                }
+            }
+            color[node] = 2; // Black - done
+        }
+
+        for start in 0..self.nodes.len() {
+            if color[start] == 0 {
+                dfs(start, &adj, &mut color, &mut back_edges);
+            }
+        }
+
+        if back_edges.is_empty() {
+            return None;
+        }
+
+        // Choose the back edge with the lowest absolute weight to minimize signal disruption
+        back_edges.into_iter().min_by(|&a, &b| {
+            let weight_a = self
+                .connections
+                .get(a)
+                .map(|c| c.weight.abs())
+                .unwrap_or(0.0);
+            let weight_b = self
+                .connections
+                .get(b)
+                .map(|c| c.weight.abs())
+                .unwrap_or(0.0);
+            weight_a
+                .partial_cmp(&weight_b)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
     }
 
     /// Get all hidden node IDs.
@@ -500,6 +563,8 @@ impl NeatGenome {
     }
 
     /// Compute compatibility distance to another genome for speciation.
+    ///
+    /// Uses O(E) hash-based lookups instead of O(E²) linear scans.
     #[must_use]
     pub fn compatibility_distance(&self, other: &NeatGenome) -> f32 {
         let mut matching = 0;
@@ -507,26 +572,27 @@ impl NeatGenome {
         let mut excess = 0;
         let mut weight_diff_sum = 0.0;
 
-        // Get sorted innovation numbers
-        let mut self_innovations: Vec<u64> =
-            self.connections.iter().map(|(_, c)| c.innovation).collect();
-        let mut other_innovations: Vec<u64> = other
+        // Build HashMap for O(1) lookup instead of O(E) find_connection_by_innovation
+        let self_by_innovation: std::collections::HashMap<u64, &ConnectionGene> = self
             .connections
             .iter()
-            .map(|(_, c)| c.innovation)
+            .map(|(_, c)| (c.innovation, c))
             .collect();
-        self_innovations.sort_unstable();
-        other_innovations.sort_unstable();
+        let other_by_innovation: std::collections::HashMap<u64, &ConnectionGene> = other
+            .connections
+            .iter()
+            .map(|(_, c)| (c.innovation, c))
+            .collect();
 
-        let self_max = self_innovations.last().copied().unwrap_or(0);
-        let other_max = other_innovations.last().copied().unwrap_or(0);
+        // Get max innovations for excess/disjoint classification
+        let self_max = self_by_innovation.keys().copied().max().unwrap_or(0);
+        let other_max = other_by_innovation.keys().copied().max().unwrap_or(0);
 
-        // Compare genes
+        // Compare genes from self
         for (_, self_conn) in &self.connections {
-            if let Some(other_conn_id) = other.find_connection_by_innovation(self_conn.innovation) {
+            if let Some(other_conn) = other_by_innovation.get(&self_conn.innovation) {
                 matching += 1;
-                weight_diff_sum +=
-                    (self_conn.weight - other.connections[other_conn_id].weight).abs();
+                weight_diff_sum += (self_conn.weight - other_conn.weight).abs();
             } else if self_conn.innovation > other_max {
                 excess += 1;
             } else {
@@ -534,11 +600,9 @@ impl NeatGenome {
             }
         }
 
+        // Count disjoint/excess genes from other that aren't in self
         for (_, other_conn) in &other.connections {
-            if self
-                .find_connection_by_innovation(other_conn.innovation)
-                .is_none()
-            {
+            if !self_by_innovation.contains_key(&other_conn.innovation) {
                 if other_conn.innovation > self_max {
                     excess += 1;
                 } else {
@@ -663,6 +727,138 @@ impl NeatGenome {
 
         let conn_id = enabled_conns[rng.random_range(0..enabled_conns.len())];
         self.add_node(conn_id, rng);
+    }
+
+    /// Perform crossover when both parents have equal fitness.
+    ///
+    /// Unlike the standard `crossover` method (which assumes `self` is fitter and
+    /// discards disjoint/excess genes from `other`), this method randomly inherits
+    /// disjoint and excess genes from **both** parents, preserving genetic diversity
+    /// as specified in the original NEAT algorithm.
+    ///
+    /// Use this method when:
+    /// - Both parents have exactly equal fitness
+    /// - You want maximum genetic diversity in offspring
+    ///
+    /// Use `crossover` (from `Genotype` trait) when:
+    /// - `self` is strictly fitter than `other`
+    /// - You want offspring to inherit the fitter parent's topology
+    #[must_use]
+    pub fn crossover_equal_fitness<R: Rng>(&self, other: &Self, rng: &mut R) -> Self {
+        let mut child = Self::minimal(self.config.clone());
+
+        let mut node_map: std::collections::HashMap<u64, NodeId> = std::collections::HashMap::new();
+
+        // Map existing nodes (input, output, bias)
+        for (id, node) in &child.nodes {
+            node_map.insert(node.innovation, id);
+        }
+
+        // Collect innovations for O(N) merge
+        let mut self_conns: Vec<_> = self.connections.iter().collect();
+        let mut other_conns: Vec<_> = other.connections.iter().collect();
+        self_conns.sort_by_key(|(_, c)| c.innovation);
+        other_conns.sort_by_key(|(_, c)| c.innovation);
+
+        let mut self_idx = 0;
+        let mut other_idx = 0;
+
+        while self_idx < self_conns.len() || other_idx < other_conns.len() {
+            let (use_self, use_other, advance_self, advance_other) =
+                match (self_conns.get(self_idx), other_conns.get(other_idx)) {
+                    (Some((_, sc)), Some((_, oc))) => {
+                        match sc.innovation.cmp(&oc.innovation) {
+                            std::cmp::Ordering::Equal => {
+                                // Matching gene - randomly inherit
+                                let use_self = rng.random::<bool>();
+                                (use_self, !use_self, true, true)
+                            }
+                            std::cmp::Ordering::Less => {
+                                // Disjoint from self - randomly inherit (equal fitness)
+                                let inherit = rng.random::<bool>();
+                                (inherit, false, true, false)
+                            }
+                            std::cmp::Ordering::Greater => {
+                                // Disjoint from other - randomly inherit (equal fitness)
+                                let inherit = rng.random::<bool>();
+                                (false, inherit, false, true)
+                            }
+                        }
+                    }
+                    (Some(_), None) => {
+                        // Excess from self - randomly inherit
+                        let inherit = rng.random::<bool>();
+                        (inherit, false, true, false)
+                    }
+                    (None, Some(_)) => {
+                        // Excess from other - randomly inherit
+                        let inherit = rng.random::<bool>();
+                        (false, inherit, false, true)
+                    }
+                    (None, None) => break,
+                };
+
+            let conn_to_add = if use_self {
+                self_conns.get(self_idx).map(|(_, c)| (*c).clone())
+            } else if use_other {
+                other_conns.get(other_idx).map(|(_, c)| (*c).clone())
+            } else {
+                None
+            };
+
+            if let Some(mut conn) = conn_to_add {
+                let source_parent = if use_self { self } else { other };
+
+                let input_inn = source_parent.nodes[conn.input].innovation;
+                let output_inn = source_parent.nodes[conn.output].innovation;
+
+                let child_input_id = if let Some(&id) = node_map.get(&input_inn) {
+                    id
+                } else {
+                    let node = source_parent.nodes[conn.input].clone();
+                    let id = child.nodes.insert(node);
+                    node_map.insert(input_inn, id);
+                    id
+                };
+
+                let child_output_id = if let Some(&id) = node_map.get(&output_inn) {
+                    id
+                } else {
+                    let node = source_parent.nodes[conn.output].clone();
+                    let id = child.nodes.insert(node);
+                    node_map.insert(output_inn, id);
+                    id
+                };
+
+                conn.input = child_input_id;
+                conn.output = child_output_id;
+
+                // For matching genes, handle disabled state
+                if use_self && use_other {
+                    let self_enabled = self_conns[self_idx].1.enabled;
+                    let other_enabled = other_conns[other_idx].1.enabled;
+                    if !self_enabled || !other_enabled {
+                        conn.enabled = rng.random::<f32>() > 0.75;
+                    }
+                }
+
+                child.connections.insert(conn);
+            }
+
+            if advance_self {
+                self_idx += 1;
+            }
+            if advance_other {
+                other_idx += 1;
+            }
+        }
+
+        if child.has_cycle() {
+            child.break_cycles();
+        }
+
+        child.update_depths();
+        child
     }
 }
 

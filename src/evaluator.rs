@@ -36,14 +36,23 @@ pub struct CppnEvaluator {
 
 impl CppnEvaluator {
     /// Compile a NEAT genome into an efficient evaluator.
+    ///
+    /// This method ensures depth consistency by recomputing depths before
+    /// building the evaluator. This guarantees correct evaluation order even
+    /// if the genome was modified without calling `update_depths()`.
     #[must_use]
     pub fn new(genome: &NeatGenome) -> Self {
+        // Clone and ensure depths are consistent before building evaluator
+        // This prevents silent numerical errors from stale depth values
+        let mut genome_copy = genome.clone();
+        genome_copy.update_depths();
+
         // Create mapping from NodeId to dense index
         let mut node_id_to_idx: std::collections::HashMap<NodeId, usize> =
             std::collections::HashMap::new();
 
         // Sort nodes by depth for topological order
-        let mut nodes: Vec<_> = genome.nodes.iter().collect();
+        let mut nodes: Vec<_> = genome_copy.nodes.iter().collect();
         nodes.sort_by_key(|(_, n)| n.depth);
 
         let mut activations = Vec::with_capacity(nodes.len());
@@ -71,17 +80,17 @@ impl CppnEvaluator {
             }
         }
 
-        // Use genome.input_ids to preserve semantic input ordering
+        // Use genome input_ids to preserve semantic input ordering
         // This ensures Input 0 is always the first input, Input 1 is second, etc.
         // regardless of SlotMap iteration order after crossover/deserialization
-        let input_indices: Vec<usize> = genome
+        let input_indices: Vec<usize> = genome_copy
             .input_ids
             .iter()
             .filter_map(|id| node_id_to_idx.get(id).copied())
             .collect();
 
-        // Use genome.output_ids to preserve semantic output ordering
-        let output_indices: Vec<usize> = genome
+        // Use genome output_ids to preserve semantic output ordering
+        let output_indices: Vec<usize> = genome_copy
             .output_ids
             .iter()
             .filter_map(|id| node_id_to_idx.get(id).copied())
@@ -89,7 +98,7 @@ impl CppnEvaluator {
 
         // Build adjacency list: incoming connections for each node
         let mut incoming: Vec<Vec<(usize, f32)>> = vec![Vec::new(); activations.len()];
-        for (_, conn) in &genome.connections {
+        for (_, conn) in &genome_copy.connections {
             if !conn.enabled {
                 continue;
             }
