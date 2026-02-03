@@ -7,6 +7,7 @@
 
 use crate::gene::{NodeId, NodeType};
 use crate::genome::NeatGenome;
+use crate::topology::GraphTopology;
 
 /// A compiled, evaluation-ready representation of a NEAT genome.
 ///
@@ -85,24 +86,32 @@ impl CppnEvaluator {
     /// Returns an error if the genome contains cycles, which would make feedforward
     /// evaluation mathematically undefined.
     ///
-    /// This method computes depths locally without cloning or modifying the genome,
-    /// making it O(V + E) in space and O(V * E) in time for depth computation.
+    /// Uses shared GraphTopology for O(V+E) depth computation with CSR format,
+    /// avoiding duplicated Vec<Vec<usize>> allocations. Edges are sorted by
+    /// innovation number for deterministic floating-point summation order.
     ///
     /// # Errors
     ///
     /// Returns [`EvaluatorError::CyclicGenome`] if the genome contains cycles.
     pub fn try_new(genome: &NeatGenome) -> Result<Self, EvaluatorError> {
-        // Compute depths locally without cloning the genome.
-        // This avoids O(V + E) clone overhead per evaluator construction.
-        let depths = Self::compute_depths(genome)?;
+        // Use shared GraphTopology for depth computation - avoids code duplication
+        // and ensures deterministic edge ordering by innovation number.
+        let topo = GraphTopology::from_genome(genome);
 
-        // Create mapping from NodeId to dense index
+        let depths = topo.compute_depths().ok_or(EvaluatorError::CyclicGenome)?;
+
+        // Build NodeId -> depth mapping for sorting
+        let depth_map: std::collections::HashMap<NodeId, u32> = (0..topo.node_count())
+            .filter_map(|idx| topo.node_id(idx).map(|id| (id, depths[idx])))
+            .collect();
+
+        // Create mapping from NodeId to dense evaluator index
         let mut node_id_to_idx: std::collections::HashMap<NodeId, usize> =
             std::collections::HashMap::new();
 
         // Sort nodes by computed depth for topological order
         let mut nodes: Vec<_> = genome.nodes.iter().collect();
-        nodes.sort_by_key(|(id, _)| depths.get(id).copied().unwrap_or(0));
+        nodes.sort_by_key(|(id, _)| depth_map.get(id).copied().unwrap_or(0));
 
         let mut activations = Vec::with_capacity(nodes.len());
         let mut biases = Vec::with_capacity(nodes.len());
@@ -145,47 +154,10 @@ impl CppnEvaluator {
             .filter_map(|id| node_id_to_idx.get(id).copied())
             .collect();
 
-        // Build CSR format for incoming connections.
-        // First pass: count incoming connections per node.
-        let num_nodes = activations.len();
-        let mut counts: Vec<usize> = vec![0; num_nodes];
-        for (_, conn) in &genome.connections {
-            if !conn.enabled {
-                continue;
-            }
-            if let Some(&to_idx) = node_id_to_idx.get(&conn.output) {
-                counts[to_idx] += 1;
-            }
-        }
-
-        // Build offsets array (exclusive prefix sum).
-        let mut csr_offsets: Vec<usize> = Vec::with_capacity(num_nodes + 1);
-        csr_offsets.push(0);
-        for &count in &counts {
-            csr_offsets.push(csr_offsets.last().unwrap() + count);
-        }
-
-        // Allocate flat arrays for sources and weights.
-        let total_edges = *csr_offsets.last().unwrap();
-        let mut csr_sources: Vec<usize> = vec![0; total_edges];
-        let mut csr_weights: Vec<f32> = vec![0.0; total_edges];
-
-        // Second pass: fill CSR arrays.
-        let mut write_pos: Vec<usize> = csr_offsets[..num_nodes].to_vec();
-        for (_, conn) in &genome.connections {
-            if !conn.enabled {
-                continue;
-            }
-            if let (Some(&from_idx), Some(&to_idx)) = (
-                node_id_to_idx.get(&conn.input),
-                node_id_to_idx.get(&conn.output),
-            ) {
-                let pos = write_pos[to_idx];
-                csr_sources[pos] = from_idx;
-                csr_weights[pos] = conn.weight;
-                write_pos[to_idx] += 1;
-            }
-        }
+        // Build CSR format with deterministic edge ordering (sorted by innovation).
+        // This ensures bit-identical floating-point results across equivalent topologies.
+        let (csr_offsets, csr_sources, csr_weights) =
+            topo.get_csr_for_evaluation(genome, &node_id_to_idx);
 
         Ok(Self {
             activations,
@@ -199,83 +171,6 @@ impl CppnEvaluator {
             bias_index,
             eval_order,
         })
-    }
-
-    /// Compute node depths without modifying the genome.
-    ///
-    /// Uses Kahn's algorithm for O(V+E) complexity instead of O(V*E) Bellman-Ford.
-    /// Returns a HashMap of NodeId -> depth, or an error if cycles are detected.
-    fn compute_depths(
-        genome: &NeatGenome,
-    ) -> Result<std::collections::HashMap<NodeId, u32>, EvaluatorError> {
-        use std::collections::VecDeque;
-
-        // Build dense index mapping for efficient array access
-        let node_ids: Vec<NodeId> = genome.nodes.keys().collect();
-        let node_count = node_ids.len();
-        let id_to_idx: std::collections::HashMap<NodeId, usize> = node_ids
-            .iter()
-            .enumerate()
-            .map(|(i, &id)| (id, i))
-            .collect();
-
-        // Build adjacency list (outgoing edges) and compute in-degrees
-        let mut adj: Vec<Vec<usize>> = vec![Vec::new(); node_count];
-        let mut in_degree: Vec<usize> = vec![0; node_count];
-
-        for (_, conn) in &genome.connections {
-            if !conn.enabled {
-                continue;
-            }
-            if let (Some(&from_idx), Some(&to_idx)) =
-                (id_to_idx.get(&conn.input), id_to_idx.get(&conn.output))
-            {
-                adj[from_idx].push(to_idx);
-                in_degree[to_idx] += 1;
-            }
-        }
-
-        // Initialize depths and queue sources (nodes with in_degree=0)
-        let mut depths: Vec<u32> = vec![0; node_count];
-        let mut queue: VecDeque<usize> = VecDeque::new();
-
-        for (idx, &deg) in in_degree.iter().enumerate() {
-            if deg == 0 {
-                queue.push_back(idx);
-            }
-        }
-
-        // Process in topological order, computing longest path
-        let mut processed = 0;
-        while let Some(u) = queue.pop_front() {
-            processed += 1;
-            for &v in &adj[u] {
-                // Longest path: depth = max(predecessor depths) + 1
-                let new_depth = depths[u].saturating_add(1);
-                if new_depth > depths[v] {
-                    depths[v] = new_depth;
-                }
-
-                in_degree[v] -= 1;
-                if in_degree[v] == 0 {
-                    queue.push_back(v);
-                }
-            }
-        }
-
-        // Check for cycles: if not all nodes processed, there's a cycle
-        if processed != node_count {
-            return Err(EvaluatorError::CyclicGenome);
-        }
-
-        // Convert to HashMap for return
-        let result: std::collections::HashMap<NodeId, u32> = node_ids
-            .iter()
-            .enumerate()
-            .map(|(idx, &id)| (id, depths[idx]))
-            .collect();
-
-        Ok(result)
     }
 
     /// Evaluate the network with given inputs, writing results to a provided buffer.

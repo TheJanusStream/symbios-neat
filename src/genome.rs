@@ -15,6 +15,7 @@ use crate::innovation::{
     connection_innovation, node_split_innovation, split_connection_a_innovation,
     split_connection_b_innovation,
 };
+use crate::topology::GraphTopology;
 
 /// Configuration for NEAT genome creation and mutation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -316,59 +317,11 @@ impl NeatGenome {
 
     /// Check if adding a connection from input_id to output_id would create a cycle.
     ///
-    /// Uses Vec<bool> indexed by SlotMap key version for O(1) visited checks
-    /// without HashMap/HashSet allocation overhead. This is called frequently
-    /// during connection mutation (up to 10 attempts per mutation).
+    /// Uses CSR-format GraphTopology for cache-friendly traversal without
+    /// per-call Vec<Vec<usize>> allocations.
     fn would_create_cycle(&self, input_id: NodeId, output_id: NodeId) -> bool {
-        // Build node index mapping for dense visited array.
-        // SlotMap iteration order is stable, so we can use enumeration.
-        let node_ids: Vec<NodeId> = self.nodes.keys().collect();
-        let node_count = node_ids.len();
-
-        // Find indices for input and output
-        let input_idx = node_ids.iter().position(|&id| id == input_id);
-        let output_idx = node_ids.iter().position(|&id| id == output_id);
-
-        let (Some(input_idx), Some(output_idx)) = (input_idx, output_idx) else {
-            return false; // Node doesn't exist
-        };
-
-        // Build adjacency list with dense indices for cache-friendly traversal
-        let mut adj: Vec<Vec<usize>> = vec![Vec::new(); node_count];
-        for (_, conn) in &self.connections {
-            if !conn.enabled {
-                continue;
-            }
-            if let (Some(from_idx), Some(to_idx)) = (
-                node_ids.iter().position(|&id| id == conn.input),
-                node_ids.iter().position(|&id| id == conn.output),
-            ) {
-                adj[from_idx].push(to_idx);
-            }
-        }
-
-        // DFS using Vec<bool> instead of HashSet - avoids heap allocation per call
-        let mut visited = vec![false; node_count];
-        let mut stack = vec![output_idx];
-
-        while let Some(current) = stack.pop() {
-            if current == input_idx {
-                return true;
-            }
-
-            if visited[current] {
-                continue;
-            }
-            visited[current] = true;
-
-            for &neighbor in &adj[current] {
-                if !visited[neighbor] {
-                    stack.push(neighbor);
-                }
-            }
-        }
-
-        false
+        let topo = GraphTopology::from_genome(self);
+        topo.would_create_cycle(input_id, output_id)
     }
 
     /// Update node depths for topological evaluation order.
@@ -377,80 +330,24 @@ impl NeatGenome {
     /// that a node is only evaluated after ALL its predecessors are ready.
     /// This is critical for correct feedforward evaluation.
     ///
-    /// Uses Kahn's algorithm for O(V+E) complexity instead of O(V*E) Bellman-Ford.
+    /// Uses CSR-format GraphTopology with Kahn's algorithm for O(V+E) complexity
+    /// without per-call Vec<Vec<usize>> allocations.
     ///
     /// Returns `true` if the graph is acyclic and depths were computed successfully,
     /// `false` if a cycle was detected.
     pub fn update_depths(&mut self) -> bool {
-        use std::collections::VecDeque;
+        let topo = GraphTopology::from_genome(self);
 
-        // Build dense index mapping for efficient array access
-        let node_ids: Vec<NodeId> = self.nodes.keys().collect();
-        let node_count = node_ids.len();
-        let id_to_idx: std::collections::HashMap<NodeId, usize> = node_ids
-            .iter()
-            .enumerate()
-            .map(|(i, &id)| (id, i))
-            .collect();
-
-        // Build adjacency list (outgoing edges) and compute in-degrees
-        let mut adj: Vec<Vec<usize>> = vec![Vec::new(); node_count];
-        let mut in_degree: Vec<usize> = vec![0; node_count];
-
-        for (_, conn) in &self.connections {
-            if !conn.enabled {
-                continue;
-            }
-            if let (Some(&from_idx), Some(&to_idx)) =
-                (id_to_idx.get(&conn.input), id_to_idx.get(&conn.output))
-            {
-                adj[from_idx].push(to_idx);
-                in_degree[to_idx] += 1;
-            }
-        }
-
-        // Initialize depths: sources (in_degree=0) get depth based on node type
-        let mut depths: Vec<u32> = vec![0; node_count];
-        let mut queue: VecDeque<usize> = VecDeque::new();
-
-        for (idx, &node_id) in node_ids.iter().enumerate() {
-            if in_degree[idx] == 0 {
-                let node = &self.nodes[node_id];
-                depths[idx] = match node.node_type {
-                    NodeType::Input | NodeType::Bias => 0,
-                    _ => 0, // Hidden nodes with no inputs start at 0
-                };
-                queue.push_back(idx);
-            }
-        }
-
-        // Process in topological order, computing longest path
-        let mut processed = 0;
-        while let Some(u) = queue.pop_front() {
-            processed += 1;
-            for &v in &adj[u] {
-                // Longest path: depth = max(predecessor depths) + 1
-                let new_depth = depths[u].saturating_add(1);
-                if new_depth > depths[v] {
-                    depths[v] = new_depth;
-                }
-
-                in_degree[v] -= 1;
-                if in_degree[v] == 0 {
-                    queue.push_back(v);
-                }
-            }
-        }
-
-        // Check for cycles: if not all nodes processed, there's a cycle
-        if processed != node_count {
-            return false;
-        }
+        let Some(depths) = topo.compute_depths() else {
+            return false; // Cycle detected
+        };
 
         // Write depths back to nodes
-        for (idx, &node_id) in node_ids.iter().enumerate() {
-            if let Some(node) = self.nodes.get_mut(node_id) {
-                node.depth = depths[idx];
+        for (idx, depth) in depths.iter().enumerate() {
+            if let Some(node_id) = topo.node_id(idx) {
+                if let Some(node) = self.nodes.get_mut(node_id) {
+                    node.depth = *depth;
+                }
             }
         }
 
@@ -459,89 +356,30 @@ impl NeatGenome {
 
     /// Check if the genome contains any cycles in its enabled connections.
     ///
-    /// Uses iterative DFS with explicit stack to avoid stack overflow on deep networks.
+    /// Uses CSR-format GraphTopology with Kahn's algorithm for O(V+E) complexity
+    /// without per-call Vec<Vec<usize>> allocations.
     #[must_use]
     pub fn has_cycle(&self) -> bool {
-        // Use DFS with coloring: 0=white (unvisited), 1=gray (in progress), 2=black (done)
-        let mut node_to_idx: std::collections::HashMap<NodeId, usize> =
-            std::collections::HashMap::new();
-        for (i, (id, _)) in self.nodes.iter().enumerate() {
-            node_to_idx.insert(id, i);
-        }
-
-        // Build adjacency list for enabled connections
-        let mut adj: Vec<Vec<usize>> = vec![Vec::new(); self.nodes.len()];
-        for (_, conn) in &self.connections {
-            if !conn.enabled {
-                continue;
-            }
-            if let (Some(&from_idx), Some(&to_idx)) =
-                (node_to_idx.get(&conn.input), node_to_idx.get(&conn.output))
-            {
-                adj[from_idx].push(to_idx);
-            }
-        }
-
-        let mut color = vec![0u8; self.nodes.len()];
-
-        // Iterative DFS using explicit stack to avoid stack overflow on deep networks
-        // Stack entries: (node, neighbor_index, is_entering)
-        // is_entering=true means we're entering the node for the first time
-        let mut stack: Vec<(usize, usize, bool)> = Vec::with_capacity(self.nodes.len());
-
-        for start in 0..self.nodes.len() {
-            if color[start] != 0 {
-                continue;
-            }
-
-            stack.push((start, 0, true));
-
-            while let Some((node, neighbor_idx, is_entering)) = stack.pop() {
-                if is_entering {
-                    color[node] = 1; // Gray - in current DFS path
-                }
-
-                // Process neighbors starting from neighbor_idx
-                let mut found_unvisited = false;
-                let neighbors = &adj[node];
-                for (offset, &neighbor) in neighbors.iter().enumerate().skip(neighbor_idx) {
-                    if color[neighbor] == 1 {
-                        // Back edge - cycle found
-                        return true;
-                    }
-                    if color[neighbor] == 0 {
-                        // Push current node back with next neighbor index
-                        stack.push((node, neighbor_idx + offset + 1, false));
-                        // Push neighbor to visit
-                        stack.push((neighbor, 0, true));
-                        found_unvisited = true;
-                        break;
-                    }
-                }
-
-                if !found_unvisited {
-                    // All neighbors processed, mark node as done
-                    color[node] = 2; // Black - done
-                }
-            }
-        }
-
-        false
+        let topo = GraphTopology::from_genome(self);
+        topo.has_cycle()
     }
 
     /// Remove connections that create cycles, keeping the graph acyclic.
     ///
-    /// Uses DFS to find actual back edges (edges that close cycles), then
-    /// disables the back edge with the lowest absolute weight to minimize
-    /// signal disruption. This is more targeted than disabling arbitrary
-    /// high-innovation connections.
+    /// Uses CSR-format GraphTopology with DFS to find actual back edges
+    /// (edges that close cycles), then disables the back edge with the
+    /// lowest absolute weight to minimize signal disruption.
     ///
     /// Returns the number of connections disabled.
     pub fn break_cycles(&mut self) -> usize {
         let mut disabled_count = 0;
 
         // Keep trying to find and break cycles until none remain
-        while let Some(back_edge_id) = self.find_back_edge() {
+        loop {
+            let topo = GraphTopology::from_genome(self);
+            let Some(back_edge_id) = topo.find_back_edge(self) else {
+                break;
+            };
             if let Some(conn) = self.connections.get_mut(back_edge_id) {
                 conn.enabled = false;
                 disabled_count += 1;
@@ -549,102 +387,6 @@ impl NeatGenome {
         }
 
         disabled_count
-    }
-
-    /// Find a back edge (an edge that creates a cycle) using DFS.
-    ///
-    /// Returns the ConnectionId of the back edge with the lowest absolute weight
-    /// among all back edges found, to minimize signal disruption when breaking cycles.
-    ///
-    /// Uses iterative DFS with explicit stack to avoid stack overflow on deep networks.
-    fn find_back_edge(&self) -> Option<ConnectionId> {
-        // Build node index mapping
-        let mut node_to_idx: std::collections::HashMap<NodeId, usize> =
-            std::collections::HashMap::new();
-        for (i, (id, _)) in self.nodes.iter().enumerate() {
-            node_to_idx.insert(id, i);
-        }
-
-        // Build adjacency list with connection IDs
-        let mut adj: Vec<Vec<(usize, ConnectionId)>> = vec![Vec::new(); self.nodes.len()];
-        for (conn_id, conn) in &self.connections {
-            if !conn.enabled {
-                continue;
-            }
-            if let (Some(&from_idx), Some(&to_idx)) =
-                (node_to_idx.get(&conn.input), node_to_idx.get(&conn.output))
-            {
-                adj[from_idx].push((to_idx, conn_id));
-            }
-        }
-
-        // DFS to find back edges
-        // Color: 0=white (unvisited), 1=gray (in progress), 2=black (done)
-        let mut color = vec![0u8; self.nodes.len()];
-        let mut back_edges: Vec<ConnectionId> = Vec::new();
-
-        // Iterative DFS using explicit stack to avoid stack overflow on deep networks
-        // Stack entries: (node, neighbor_index, is_entering)
-        let mut stack: Vec<(usize, usize, bool)> = Vec::with_capacity(self.nodes.len());
-
-        for start in 0..self.nodes.len() {
-            if color[start] != 0 {
-                continue;
-            }
-
-            stack.push((start, 0, true));
-
-            while let Some((node, neighbor_idx, is_entering)) = stack.pop() {
-                if is_entering {
-                    color[node] = 1; // Gray - in current DFS path
-                }
-
-                // Process neighbors starting from neighbor_idx
-                let mut found_unvisited = false;
-                let neighbors = &adj[node];
-                for (offset, &(neighbor, conn_id)) in
-                    neighbors.iter().enumerate().skip(neighbor_idx)
-                {
-                    if color[neighbor] == 1 {
-                        // Back edge found - neighbor is an ancestor in current path
-                        back_edges.push(conn_id);
-                    } else if color[neighbor] == 0 {
-                        // Push current node back with next neighbor index
-                        stack.push((node, neighbor_idx + offset + 1, false));
-                        // Push neighbor to visit
-                        stack.push((neighbor, 0, true));
-                        found_unvisited = true;
-                        break;
-                    }
-                }
-
-                if !found_unvisited {
-                    // All neighbors processed, mark node as done
-                    color[node] = 2; // Black - done
-                }
-            }
-        }
-
-        if back_edges.is_empty() {
-            return None;
-        }
-
-        // Choose the back edge with the lowest absolute weight to minimize signal disruption
-        back_edges.into_iter().min_by(|&a, &b| {
-            let weight_a = self
-                .connections
-                .get(a)
-                .map(|c| c.weight.abs())
-                .unwrap_or(0.0);
-            let weight_b = self
-                .connections
-                .get(b)
-                .map(|c| c.weight.abs())
-                .unwrap_or(0.0);
-            weight_a
-                .partial_cmp(&weight_b)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
     }
 
     /// Get all hidden node IDs.

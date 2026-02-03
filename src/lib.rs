@@ -98,6 +98,7 @@ pub mod evaluator;
 pub mod gene;
 pub mod genome;
 pub mod innovation;
+pub mod topology;
 
 // Re-exports for convenience
 pub use activation::Activation;
@@ -108,6 +109,7 @@ pub use innovation::{
     connection_innovation, node_split_innovation, split_connection_a_innovation,
     split_connection_b_innovation,
 };
+pub use topology::GraphTopology;
 
 #[cfg(test)]
 mod tests {
