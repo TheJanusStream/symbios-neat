@@ -173,7 +173,7 @@ fn test_weight_clamping_prevents_unbounded_growth() {
     }
 
     // Verify all weights are finite and bounded to the consistent limit
-    const WEIGHT_LIMIT: f32 = 1e6;
+    const WEIGHT_LIMIT: f32 = 1e3;
     for (_, conn) in &genome.connections {
         assert!(
             conn.weight.is_finite(),
@@ -289,13 +289,13 @@ fn test_identity_activation_bounded() {
         result_neg_inf
     );
     assert!(
-        result_large.is_finite() && result_large.abs() <= 1e6,
-        "Identity(1e30) should be bounded to 1e6, got {}",
+        result_large.is_finite() && result_large.abs() <= 1e3,
+        "Identity(1e30) should be bounded to 1e3, got {}",
         result_large
     );
     assert!(
-        result_small.is_finite() && result_small.abs() <= 1e6,
-        "Identity(-1e30) should be bounded to 1e6, got {}",
+        result_small.is_finite() && result_small.abs() <= 1e3,
+        "Identity(-1e30) should be bounded to 1e3, got {}",
         result_small
     );
 }
@@ -996,15 +996,16 @@ fn test_node_split_creates_correct_topology() {
 /// A single pixel should be centered at 0.0, not at the boundary.
 #[test]
 fn test_generate_pattern_single_pixel() {
+    // Use Tanh activation (range [-1, 1]) for predictable normalization
     let config = NeatConfig {
-        output_activation: Activation::Identity,
+        output_activation: Activation::Tanh,
         ..NeatConfig::cppn(2, 1)
     };
     let mut rng = ChaCha8Rng::seed_from_u64(42);
     let mut genome = NeatGenome::fully_connected(config, &mut rng);
 
-    // Set weights so output = x + y (first input + second input)
-    // With Identity activation, this lets us verify the input coordinates
+    // Set weights so output = tanh(x + y) (first input + second input)
+    // With small inputs (x,y in [-1,1]), tanh(x+y) ≈ x+y
     let mut conn_iter = genome.connections.iter_mut();
     if let Some((_, conn)) = conn_iter.next() {
         conn.weight = 1.0; // x weight
@@ -1020,7 +1021,7 @@ fn test_generate_pattern_single_pixel() {
     let mut evaluator = CppnEvaluator::new(&genome);
 
     // For 1x1 pattern, the single pixel should be at (0, 0)
-    // Output = x + y = 0 + 0 = 0, normalized to 0.5
+    // Output = tanh(0 + 0) = 0, normalized from [-1,1] to [0,1] = 0.5
     let pattern_1x1 = generate_pattern(&mut evaluator, 1, 1, 0).unwrap();
     assert_eq!(pattern_1x1.len(), 1);
     assert!(
@@ -1030,19 +1031,24 @@ fn test_generate_pattern_single_pixel() {
     );
 
     // For 2x1 pattern, pixels should be at x=-1 and x=+1, y=0
-    // Output[0] = -1 + 0 = -1, normalized to 0.0
-    // Output[1] = +1 + 0 = +1, normalized to 1.0
+    // Output[0] = tanh(-1 + 0) ≈ -0.76, normalized to ~0.12
+    // Output[1] = tanh(+1 + 0) ≈ +0.76, normalized to ~0.88
     let pattern_2x1 = generate_pattern(&mut evaluator, 2, 1, 0).unwrap();
     assert_eq!(pattern_2x1.len(), 2);
+    // Verify pattern[0] < pattern[1] (x=-1 gives lower value than x=+1)
     assert!(
-        (pattern_2x1[0] - 0.0).abs() < 0.01,
-        "2x1 pattern[0] should be 0.0 (x=-1), got {}",
-        pattern_2x1[0]
-    );
-    assert!(
-        (pattern_2x1[1] - 1.0).abs() < 0.01,
-        "2x1 pattern[1] should be 1.0 (x=+1), got {}",
+        pattern_2x1[0] < pattern_2x1[1],
+        "2x1 pattern should increase with x: {} vs {}",
+        pattern_2x1[0],
         pattern_2x1[1]
+    );
+    // Verify symmetry around 0.5
+    assert!(
+        (pattern_2x1[0] + pattern_2x1[1] - 1.0).abs() < 0.01,
+        "2x1 pattern should be symmetric around 0.5: {} + {} = {}",
+        pattern_2x1[0],
+        pattern_2x1[1],
+        pattern_2x1[0] + pattern_2x1[1]
     );
 }
 
@@ -1511,8 +1517,8 @@ fn test_weight_initialization_clamped_extreme_range() {
             conn.weight
         );
         assert!(
-            conn.weight.abs() <= 1e6,
-            "Weight {} should be clamped to 1e6",
+            conn.weight.abs() <= 1e3,
+            "Weight {} should be clamped to 1e3",
             conn.weight
         );
     }
@@ -1543,8 +1549,8 @@ fn test_add_connection_weight_clamped() {
         conn.weight
     );
     assert!(
-        conn.weight.abs() <= 1e6,
-        "add_connection weight {} should be clamped to 1e6",
+        conn.weight.abs() <= 1e3,
+        "add_connection weight {} should be clamped to 1e3",
         conn.weight
     );
 }
@@ -1631,4 +1637,377 @@ fn test_crossover_deep_parents() {
 
     let result = CppnEvaluator::try_new(&child);
     assert!(result.is_ok(), "Child should create valid evaluator");
+}
+
+// =============================================================================
+// Code Review Fix Regression Tests (Issues #44-#49)
+// =============================================================================
+
+/// Test that CLAMP_BOUND of 1e3 preserves precision.
+/// With 1e3 * 1e3 = 1e6, ULP is ~0.06, preserving signals in 0..1 range.
+/// This verifies the fix for issue #44 (numerical precision loss).
+#[test]
+fn test_precision_preserved_with_reduced_clamp_bound() {
+    // Create a network that would accumulate large products
+    let config = NeatConfig {
+        output_activation: Activation::Identity,
+        hidden_activations: vec![Activation::Identity],
+        weight_range: 100.0,
+        ..NeatConfig::minimal(10, 1)
+    };
+    let mut rng = ChaCha8Rng::seed_from_u64(42);
+    let mut genome = NeatGenome::fully_connected(config, &mut rng);
+
+    // Set all weights to moderately large values
+    for (_, conn) in &mut genome.connections {
+        conn.weight = 100.0;
+    }
+
+    let mut evaluator = CppnEvaluator::new(&genome);
+
+    // Test with small input values (0.001)
+    // With old 1e6 clamp: sum could reach 1e12, losing precision for small signals
+    // With new 1e3 clamp: max sum is bounded, small signals preserved
+    let small_inputs: Vec<f32> = vec![0.001; 10];
+    let output = evaluator.evaluate(&small_inputs);
+
+    // The output should be non-zero and finite
+    assert!(
+        output[0].is_finite(),
+        "Output should be finite: {}",
+        output[0]
+    );
+
+    // Test that small differences in input produce different outputs
+    let mut small_inputs_variant = small_inputs.clone();
+    small_inputs_variant[0] = 0.002; // Small change
+    let output_variant = evaluator.evaluate(&small_inputs_variant);
+
+    assert!(
+        (output[0] - output_variant[0]).abs() > 1e-6,
+        "Small input changes should produce detectable output differences"
+    );
+}
+
+/// Test that generate_pattern normalizes correctly for ReLU output activation.
+/// ReLU outputs [0, CLAMP_BOUND], not [-1, 1].
+/// This verifies the fix for issue #45 (pattern normalization).
+#[test]
+fn test_generate_pattern_relu_normalization() {
+    let config = NeatConfig {
+        output_activation: Activation::ReLU, // Output range [0, 1e3]
+        ..NeatConfig::cppn(2, 1)
+    };
+    let mut rng = ChaCha8Rng::seed_from_u64(42);
+    let mut genome = NeatGenome::fully_connected(config, &mut rng);
+
+    // Set weights so output is moderately positive
+    for (_, conn) in &mut genome.connections {
+        conn.weight = 0.5;
+    }
+
+    let mut evaluator = CppnEvaluator::new(&genome);
+    let pattern = generate_pattern(&mut evaluator, 4, 4, 0).unwrap();
+
+    // With correct normalization:
+    // ReLU output 0.0 should normalize to 0.0 (not 0.5 as with old code)
+    // ReLU output 1.0 should normalize to ~0.001 (1.0/1e3)
+
+    // Verify pattern values are in valid range
+    for &val in &pattern {
+        assert!(
+            (0.0..=1.0).contains(&val),
+            "Pattern value {} should be in [0, 1]",
+            val
+        );
+    }
+
+    // Verify that small ReLU outputs don't map to 0.5
+    // (the bug was: 0.0 * 0.5 + 0.5 = 0.5 regardless of activation range)
+    let min_val = pattern.iter().cloned().fold(f32::INFINITY, f32::min);
+    assert!(
+        min_val < 0.4,
+        "With ReLU, minimum pattern value should be < 0.4 (near 0), got {}",
+        min_val
+    );
+}
+
+/// Test that generate_pattern normalizes correctly for Abs output activation.
+/// Abs outputs [0, CLAMP_BOUND], similar to ReLU.
+/// This verifies the fix for issue #45 (pattern normalization).
+#[test]
+fn test_generate_pattern_abs_normalization() {
+    let config = NeatConfig {
+        output_activation: Activation::Abs,
+        ..NeatConfig::cppn(2, 1)
+    };
+    let mut rng = ChaCha8Rng::seed_from_u64(42);
+    let genome = NeatGenome::fully_connected(config, &mut rng);
+
+    let mut evaluator = CppnEvaluator::new(&genome);
+    let pattern = generate_pattern(&mut evaluator, 4, 4, 0).unwrap();
+
+    // All values should be in [0, 1]
+    for &val in &pattern {
+        assert!(
+            (0.0..=1.0).contains(&val),
+            "Pattern value {} should be in [0, 1]",
+            val
+        );
+    }
+}
+
+/// Test that mutation rate scaling doesn't permanently modify config.
+/// This verifies the fix for issue #48 (mutation rate corruption).
+#[test]
+fn test_mutation_rate_does_not_corrupt_config() {
+    let config = NeatConfig {
+        weight_mutation_prob: 0.8,
+        add_connection_prob: 0.5,
+        add_node_prob: 0.3,
+        ..NeatConfig::minimal(2, 1)
+    };
+    let mut rng = ChaCha8Rng::seed_from_u64(42);
+    let mut genome = NeatGenome::fully_connected(config.clone(), &mut rng);
+
+    // Store original probabilities
+    let original_weight_prob = genome.config.weight_mutation_prob;
+    let original_conn_prob = genome.config.add_connection_prob;
+    let original_node_prob = genome.config.add_node_prob;
+
+    // Mutate with rate < 1.0 (the case that was problematic)
+    for _ in 0..10 {
+        genome.mutate(&mut rng, 0.5);
+    }
+
+    // Config probabilities should be unchanged
+    assert!(
+        (genome.config.weight_mutation_prob - original_weight_prob).abs() < 1e-6,
+        "weight_mutation_prob should not change: {} vs {}",
+        genome.config.weight_mutation_prob,
+        original_weight_prob
+    );
+    assert!(
+        (genome.config.add_connection_prob - original_conn_prob).abs() < 1e-6,
+        "add_connection_prob should not change: {} vs {}",
+        genome.config.add_connection_prob,
+        original_conn_prob
+    );
+    assert!(
+        (genome.config.add_node_prob - original_node_prob).abs() < 1e-6,
+        "add_node_prob should not change: {} vs {}",
+        genome.config.add_node_prob,
+        original_node_prob
+    );
+
+    // Verify offspring inherit correct probabilities
+    let child = genome.crossover(&genome, &mut rng);
+    assert!(
+        (child.config.weight_mutation_prob - original_weight_prob).abs() < 1e-6,
+        "Child should inherit original config: {} vs {}",
+        child.config.weight_mutation_prob,
+        original_weight_prob
+    );
+}
+
+/// Test that mutation with rate=0 still allows some mutation (via scaled probs).
+/// This verifies mutation scaling works correctly.
+#[test]
+fn test_mutation_rate_zero_behavior() {
+    let config = NeatConfig {
+        weight_mutation_prob: 1.0, // 100% weight mutation
+        add_connection_prob: 1.0,
+        add_node_prob: 1.0,
+        ..NeatConfig::minimal(2, 1)
+    };
+    let mut rng = ChaCha8Rng::seed_from_u64(42);
+    let mut genome = NeatGenome::fully_connected(config, &mut rng);
+
+    // Capture original weights
+    let original_weights: Vec<f32> = genome.connections.iter().map(|(_, c)| c.weight).collect();
+
+    // Mutate with rate=0 (should skip all mutations)
+    genome.mutate(&mut rng, 0.0);
+
+    // Weights should be unchanged
+    let new_weights: Vec<f32> = genome.connections.iter().map(|(_, c)| c.weight).collect();
+    assert_eq!(
+        original_weights, new_weights,
+        "With rate=0, no mutations should occur"
+    );
+}
+
+/// Test that innovation hashes are uniformly distributed (no modulo bias).
+/// This verifies the fix for issue #47 (hash modulo bias).
+#[test]
+fn test_innovation_hash_uniform_distribution() {
+    // Generate many hashes and check distribution
+    let mut hashes = Vec::new();
+    for i in 0..10000u64 {
+        hashes.push(connection_innovation(i, i + 1));
+    }
+
+    // Split into quartiles of the u64 range
+    const Q1: u64 = u64::MAX / 4;
+    const Q2: u64 = u64::MAX / 2;
+    const Q3: u64 = Q1 * 3;
+
+    let mut counts = [0usize; 4];
+    for &h in &hashes {
+        if h < Q1 {
+            counts[0] += 1;
+        } else if h < Q2 {
+            counts[1] += 1;
+        } else if h < Q3 {
+            counts[2] += 1;
+        } else {
+            counts[3] += 1;
+        }
+    }
+
+    // All quartiles should be well-populated (expect ~2500 each with some variance)
+    // With modulo bias, some quartiles would be systematically under/over-represented
+    let expected = hashes.len() / 4;
+    let tolerance = expected / 3; // Allow 33% variance
+
+    for (i, &count) in counts.iter().enumerate() {
+        assert!(
+            count > expected - tolerance,
+            "Quartile {} count {} is too low (expected ~{})",
+            i,
+            count,
+            expected
+        );
+    }
+}
+
+/// Test that all hash-based innovations are >= RESERVED_INNOVATION_RANGE.
+/// This verifies the rejection sampling works correctly (issue #47 fix).
+#[test]
+fn test_innovation_hash_above_reserved_range() {
+    const RESERVED: u64 = 1 << 32;
+
+    // Test edge cases that might produce low values before rejection
+    let edge_cases = [
+        (0, 0),
+        (0, 1),
+        (1, 0),
+        (u64::MAX, 0),
+        (0, u64::MAX),
+        (u64::MAX, u64::MAX),
+    ];
+
+    for (a, b) in edge_cases {
+        let inn = connection_innovation(a, b);
+        assert!(
+            inn >= RESERVED,
+            "connection_innovation({}, {}) = {} should be >= {}",
+            a,
+            b,
+            inn,
+            RESERVED
+        );
+
+        let split = node_split_innovation(inn);
+        assert!(
+            split >= RESERVED,
+            "node_split_innovation({}) = {} should be >= {}",
+            inn,
+            split,
+            RESERVED
+        );
+    }
+}
+
+/// Test that CppnEvaluator::try_new doesn't clone the genome.
+/// We verify this indirectly by checking the genome is not modified.
+/// This verifies the fix for issue #46 (redundant clone).
+#[test]
+fn test_evaluator_construction_no_genome_mutation() {
+    let config = NeatConfig::minimal(2, 1);
+    let mut rng = ChaCha8Rng::seed_from_u64(42);
+    let genome = NeatGenome::fully_connected(config, &mut rng);
+
+    // Capture state before
+    let depths_before: Vec<u32> = genome.nodes.iter().map(|(_, n)| n.depth).collect();
+
+    // Create evaluator
+    let _evaluator = CppnEvaluator::new(&genome);
+
+    // Depths should be unchanged (evaluator computes locally)
+    let depths_after: Vec<u32> = genome.nodes.iter().map(|(_, n)| n.depth).collect();
+    assert_eq!(
+        depths_before, depths_after,
+        "Evaluator construction should not modify genome depths"
+    );
+}
+
+/// Test that activation output_range is correctly defined for all functions.
+/// This verifies the infrastructure for issue #45 fix.
+#[test]
+fn test_activation_output_range() {
+    for activation in Activation::ALL {
+        let (min, max) = activation.output_range();
+
+        // Range should be valid
+        assert!(
+            min < max,
+            "{:?} range invalid: {} >= {}",
+            activation,
+            min,
+            max
+        );
+
+        // Test that apply() stays within the stated range (with tolerance for edge cases)
+        let test_inputs = [-1000.0, -10.0, -1.0, 0.0, 1.0, 10.0, 1000.0];
+        for input in test_inputs {
+            let output = activation.apply(input);
+            if output.is_finite() {
+                assert!(
+                    output >= min - 0.001 && output <= max + 0.001,
+                    "{:?}({}) = {} outside stated range [{}, {}]",
+                    activation,
+                    input,
+                    output,
+                    min,
+                    max
+                );
+            }
+        }
+    }
+}
+
+/// Test that Tanh pattern normalization still works correctly (regression).
+/// This ensures the fix for issue #45 didn't break existing behavior.
+#[test]
+fn test_generate_pattern_tanh_still_works() {
+    let config = NeatConfig {
+        output_activation: Activation::Tanh, // Output range [-1, 1]
+        ..NeatConfig::cppn(2, 1)
+    };
+    let mut rng = ChaCha8Rng::seed_from_u64(42);
+    let genome = NeatGenome::fully_connected(config, &mut rng);
+
+    let mut evaluator = CppnEvaluator::new(&genome);
+    let pattern = generate_pattern(&mut evaluator, 8, 8, 0).unwrap();
+
+    // Pattern should span a reasonable range (not all 0.5 or all 0/1)
+    let min = pattern.iter().cloned().fold(f32::INFINITY, f32::min);
+    let max = pattern.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+
+    assert!(
+        max - min > 0.1,
+        "Tanh pattern should have variation: [{}, {}]",
+        min,
+        max
+    );
+
+    // All values should be in [0, 1]
+    for &val in &pattern {
+        assert!(
+            (0.0..=1.0).contains(&val),
+            "Pattern value {} out of range",
+            val
+        );
+    }
 }

@@ -43,7 +43,7 @@ impl Hasher for InnovationHasher {
 
     #[inline]
     fn finish(&self) -> u64 {
-        // Final mixing to improve avalanche
+        // Final mixing using MurmurHash3 finalizer for good avalanche
         let mut h = self.state;
         h ^= h >> 33;
         h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
@@ -52,10 +52,19 @@ impl Hasher for InnovationHasher {
         h ^= h >> 33;
 
         // Ensure hash never collides with reserved range for fixed node IDs.
-        // Map the hash to [RESERVED_INNOVATION_RANGE, u64::MAX] while
-        // preserving uniform distribution.
-        let range = u64::MAX - RESERVED_INNOVATION_RANGE;
-        RESERVED_INNOVATION_RANGE + (h % range)
+        // Use rejection sampling to avoid modulo bias (which occurs when
+        // mapping to non-power-of-two ranges via %).
+        // Probability of rejection is 2^32 / 2^64 = 2^-32 (astronomically small).
+        loop {
+            if h >= RESERVED_INNOVATION_RANGE {
+                return h;
+            }
+            // Extremely unlikely path - re-mix with different state
+            h = h.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            h ^= h >> 33;
+            h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+            h ^= h >> 33;
+        }
     }
 }
 

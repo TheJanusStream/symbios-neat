@@ -80,26 +80,24 @@ impl CppnEvaluator {
     /// Returns an error if the genome contains cycles, which would make feedforward
     /// evaluation mathematically undefined.
     ///
+    /// This method computes depths locally without cloning or modifying the genome,
+    /// making it O(V + E) in space and O(V * E) in time for depth computation.
+    ///
     /// # Errors
     ///
     /// Returns [`EvaluatorError::CyclicGenome`] if the genome contains cycles.
     pub fn try_new(genome: &NeatGenome) -> Result<Self, EvaluatorError> {
-        // Clone and ensure depths are consistent before building evaluator
-        // This prevents silent numerical errors from stale depth values
-        let mut genome_copy = genome.clone();
-        let is_acyclic = genome_copy.update_depths();
-
-        if !is_acyclic {
-            return Err(EvaluatorError::CyclicGenome);
-        }
+        // Compute depths locally without cloning the genome.
+        // This avoids O(V + E) clone overhead per evaluator construction.
+        let depths = Self::compute_depths(genome)?;
 
         // Create mapping from NodeId to dense index
         let mut node_id_to_idx: std::collections::HashMap<NodeId, usize> =
             std::collections::HashMap::new();
 
-        // Sort nodes by depth for topological order
-        let mut nodes: Vec<_> = genome_copy.nodes.iter().collect();
-        nodes.sort_by_key(|(_, n)| n.depth);
+        // Sort nodes by computed depth for topological order
+        let mut nodes: Vec<_> = genome.nodes.iter().collect();
+        nodes.sort_by_key(|(id, _)| depths.get(id).copied().unwrap_or(0));
 
         let mut activations = Vec::with_capacity(nodes.len());
         let mut biases = Vec::with_capacity(nodes.len());
@@ -129,14 +127,14 @@ impl CppnEvaluator {
         // Use genome input_ids to preserve semantic input ordering
         // This ensures Input 0 is always the first input, Input 1 is second, etc.
         // regardless of SlotMap iteration order after crossover/deserialization
-        let input_indices: Vec<usize> = genome_copy
+        let input_indices: Vec<usize> = genome
             .input_ids
             .iter()
             .filter_map(|id| node_id_to_idx.get(id).copied())
             .collect();
 
         // Use genome output_ids to preserve semantic output ordering
-        let output_indices: Vec<usize> = genome_copy
+        let output_indices: Vec<usize> = genome
             .output_ids
             .iter()
             .filter_map(|id| node_id_to_idx.get(id).copied())
@@ -144,7 +142,7 @@ impl CppnEvaluator {
 
         // Build adjacency list: incoming connections for each node
         let mut incoming: Vec<Vec<(usize, f32)>> = vec![Vec::new(); activations.len()];
-        for (_, conn) in &genome_copy.connections {
+        for (_, conn) in &genome.connections {
             if !conn.enabled {
                 continue;
             }
@@ -166,6 +164,57 @@ impl CppnEvaluator {
             bias_index,
             eval_order,
         })
+    }
+
+    /// Compute node depths without modifying the genome.
+    ///
+    /// Returns a HashMap of NodeId -> depth, or an error if cycles are detected.
+    fn compute_depths(
+        genome: &NeatGenome,
+    ) -> Result<std::collections::HashMap<NodeId, u32>, EvaluatorError> {
+        let mut depths: std::collections::HashMap<NodeId, u32> = std::collections::HashMap::new();
+
+        // Initialize depths: inputs/bias at 0
+        for (id, node) in &genome.nodes {
+            let initial_depth = match node.node_type {
+                NodeType::Input | NodeType::Bias => 0,
+                _ => 0, // Will be updated to longest path
+            };
+            depths.insert(id, initial_depth);
+        }
+
+        // Iteratively propagate depths (longest path = max predecessor depth + 1).
+        // Limit iterations to detect cycles.
+        let max_iterations = genome.nodes.len();
+        let mut iterations = 0;
+        let mut changed = true;
+
+        while changed && iterations < max_iterations {
+            changed = false;
+            iterations += 1;
+
+            for (_, conn) in &genome.connections {
+                if !conn.enabled {
+                    continue;
+                }
+                if let (Some(&input_depth), Some(&output_depth)) =
+                    (depths.get(&conn.input), depths.get(&conn.output))
+                {
+                    let new_depth = input_depth.saturating_add(1);
+                    if new_depth > output_depth {
+                        depths.insert(conn.output, new_depth);
+                        changed = true;
+                    }
+                }
+            }
+        }
+
+        // If still changing after max iterations, there's a cycle
+        if changed {
+            return Err(EvaluatorError::CyclicGenome);
+        }
+
+        Ok(depths)
     }
 
     /// Evaluate the network with given inputs, writing results to a provided buffer.
@@ -295,6 +344,16 @@ impl CppnEvaluator {
     pub const fn num_outputs(&self) -> usize {
         self.output_indices.len()
     }
+
+    /// Get the activation function for a specific output node.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `output_index` is out of bounds.
+    #[must_use]
+    pub fn output_activation(&self, output_index: usize) -> crate::activation::Activation {
+        self.activation_fns[self.output_indices[output_index]]
+    }
 }
 
 /// Error type for pattern generation failures.
@@ -390,8 +449,16 @@ pub fn generate_pattern(
             // SAFETY: We validated output_index at function entry
             let value = outputs[output_index];
 
-            // Normalize output to [0, 1]
-            let normalized = value.mul_add(0.5, 0.5);
+            // Normalize output to [0, 1] based on activation function's range.
+            // This correctly handles all activations (ReLU, Identity, etc.),
+            // not just bounded ones like Tanh/Sigmoid.
+            let (min_val, max_val) = evaluator.output_activation(output_index).output_range();
+            let range = max_val - min_val;
+            let normalized = if range > 0.0 {
+                (value - min_val) / range
+            } else {
+                0.5 // Degenerate case: single-value range
+            };
             pattern.push(normalized.clamp(0.0, 1.0));
         }
     }

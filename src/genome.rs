@@ -175,9 +175,9 @@ impl NeatGenome {
         // This is equivalent to: random * 2 * range - range = range * (2 * random - 1)
         let raw = rng.random::<f32>().mul_add(2.0, -1.0) * weight_range;
 
-        // Clamp to a safe range to prevent Inf/NaN propagation
-        // Use 1e6 as the absolute limit (same as Identity activation clamping)
-        const WEIGHT_LIMIT: f32 = 1e6;
+        // Clamp to a safe range to prevent Inf/NaN propagation AND preserve precision.
+        // Use 1e3 to match activation CLAMP_BOUND: max product is 1e6, ULP ~0.06.
+        const WEIGHT_LIMIT: f32 = 1e3;
         raw.clamp(-WEIGHT_LIMIT, WEIGHT_LIMIT)
     }
 
@@ -679,13 +679,13 @@ impl NeatGenome {
             + (self.config.compatibility_weight_coeff * avg_weight_diff)
     }
 
-    /// Mutate weights of existing connections.
-    fn mutate_weights<R: Rng>(&mut self, rng: &mut R) {
+    /// Mutate weights of existing connections with explicit probability.
+    fn mutate_weights_with_prob<R: Rng>(&mut self, rng: &mut R, weight_mutation_prob: f32) {
         // Use same weight limit as random_weight for consistency
-        const WEIGHT_LIMIT: f32 = 1e6;
+        const WEIGHT_LIMIT: f32 = 1e3;
 
         for (_, conn) in &mut self.connections {
-            if rng.random::<f32>() < self.config.weight_mutation_prob {
+            if rng.random::<f32>() < weight_mutation_prob {
                 if rng.random::<f32>() < self.config.weight_replace_prob {
                     // Replace with new random weight (using helper for safe generation)
                     conn.weight = Self::random_weight(rng, self.config.weight_range);
@@ -725,9 +725,9 @@ impl NeatGenome {
         }
     }
 
-    /// Try to add a random new connection.
-    fn mutate_add_connection<R: Rng>(&mut self, rng: &mut R) {
-        if rng.random::<f32>() >= self.config.add_connection_prob {
+    /// Try to add a random new connection with explicit probability.
+    fn mutate_add_connection_with_prob<R: Rng>(&mut self, rng: &mut R, add_connection_prob: f32) {
+        if rng.random::<f32>() >= add_connection_prob {
             return;
         }
 
@@ -762,9 +762,9 @@ impl NeatGenome {
         }
     }
 
-    /// Try to add a node by splitting a random connection.
-    fn mutate_add_node<R: Rng>(&mut self, rng: &mut R) {
-        if rng.random::<f32>() >= self.config.add_node_prob {
+    /// Try to add a node by splitting a random connection with explicit probability.
+    fn mutate_add_node_with_prob<R: Rng>(&mut self, rng: &mut R, add_node_prob: f32) {
+        if rng.random::<f32>() >= add_node_prob {
             return;
         }
 
@@ -918,25 +918,20 @@ impl NeatGenome {
 
 impl Genotype for NeatGenome {
     fn mutate<R: Rng>(&mut self, rng: &mut R, rate: f32) {
-        // Scale mutation probabilities by rate
-        let original_weight_prob = self.config.weight_mutation_prob;
-        let original_add_conn_prob = self.config.add_connection_prob;
-        let original_add_node_prob = self.config.add_node_prob;
+        // Scale mutation probabilities by rate using local variables.
+        // We do NOT modify self.config to avoid corruption if:
+        // - The genome is cloned mid-mutation
+        // - A panic occurs during mutation
+        // - The genome is used as a parent (would inherit decayed probabilities)
+        let scaled_weight_prob = self.config.weight_mutation_prob * rate;
+        let scaled_add_conn_prob = self.config.add_connection_prob * rate;
+        let scaled_add_node_prob = self.config.add_node_prob * rate;
 
-        self.config.weight_mutation_prob *= rate;
-        self.config.add_connection_prob *= rate;
-        self.config.add_node_prob *= rate;
-
-        self.mutate_weights(rng);
+        self.mutate_weights_with_prob(rng, scaled_weight_prob);
         self.mutate_activations(rng);
         self.mutate_toggle_enabled(rng);
-        self.mutate_add_connection(rng);
-        self.mutate_add_node(rng);
-
-        // Restore original probabilities
-        self.config.weight_mutation_prob = original_weight_prob;
-        self.config.add_connection_prob = original_add_conn_prob;
-        self.config.add_node_prob = original_add_node_prob;
+        self.mutate_add_connection_with_prob(rng, scaled_add_conn_prob);
+        self.mutate_add_node_with_prob(rng, scaled_add_node_prob);
     }
 
     fn crossover<R: Rng>(&self, other: &Self, rng: &mut R) -> Self {

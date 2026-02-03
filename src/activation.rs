@@ -60,6 +60,27 @@ impl Activation {
         Self::Abs,
     ];
 
+    /// Returns the output range `(min, max)` for this activation function.
+    ///
+    /// This is useful for normalizing outputs to `[0, 1]` for pattern generation.
+    /// The ranges account for the clamping applied in `apply()`.
+    #[must_use]
+    pub const fn output_range(self) -> (f32, f32) {
+        const CLAMP_BOUND: f32 = 1e3;
+        match self {
+            Self::Identity => (-CLAMP_BOUND, CLAMP_BOUND),
+            Self::Sigmoid => (0.0, 1.0),
+            Self::Tanh => (-1.0, 1.0),
+            Self::ReLU => (0.0, CLAMP_BOUND),
+            Self::Sine => (-1.0, 1.0),
+            Self::Cosine => (-1.0, 1.0),
+            Self::Gaussian => (0.0, 1.0),
+            Self::Abs => (0.0, CLAMP_BOUND),
+            Self::Step => (0.0, 1.0),
+            Self::LeakyReLU => (-CLAMP_BOUND, CLAMP_BOUND),
+        }
+    }
+
     /// Apply this activation function to an input value.
     ///
     /// All activation functions propagate NaN consistently.
@@ -73,10 +94,12 @@ impl Activation {
             return f32::NAN;
         }
 
-        // Clamp bound to prevent overflow propagation in Identity and unbounded functions.
-        // 1e6 is large enough to represent meaningful signals but small enough
-        // that weight * activation won't overflow f32 in typical networks.
-        const CLAMP_BOUND: f32 = 1e6;
+        // Clamp bound to prevent overflow AND preserve f32 precision.
+        // With CLAMP_BOUND = 1e3 and weight limit = 1e3, max product is 1e6.
+        // At 1e6, f32 ULP is ~0.06, preserving signal precision.
+        // Previous value of 1e6 caused precision loss: at 1e12 (activation*weight),
+        // ULP is ~131072, destroying any signal smaller than 131072.
+        const CLAMP_BOUND: f32 = 1e3;
 
         match self {
             Self::Identity => {
