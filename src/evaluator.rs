@@ -11,8 +11,8 @@ use crate::genome::NeatGenome;
 /// A compiled, evaluation-ready representation of a NEAT genome.
 ///
 /// The evaluator pre-computes topological order and organizes data for
-/// cache-efficient forward propagation. Uses adjacency lists for O(N+E)
-/// evaluation instead of O(N×E).
+/// cache-efficient forward propagation. Uses Compressed Sparse Row (CSR) format
+/// for O(N+E) evaluation with optimal cache locality.
 #[derive(Debug, Clone)]
 pub struct CppnEvaluator {
     /// Node activations in topological order.
@@ -21,9 +21,14 @@ pub struct CppnEvaluator {
     biases: Vec<f32>,
     /// Activation function indices.
     activation_fns: Vec<crate::activation::Activation>,
-    /// Adjacency list: for each node, a list of (from_idx, weight) for incoming connections.
-    /// This enables O(N+E) evaluation instead of O(N×E).
-    incoming: Vec<Vec<(usize, f32)>>,
+    // CSR format for incoming connections - contiguous memory for cache locality.
+    // For node i, incoming connections are at indices [csr_offsets[i]..csr_offsets[i+1]).
+    /// CSR: source node indices for all connections (flat array).
+    csr_sources: Vec<usize>,
+    /// CSR: weights for all connections (flat array, parallel to csr_sources).
+    csr_weights: Vec<f32>,
+    /// CSR: offsets into csr_sources/csr_weights for each node (len = num_nodes + 1).
+    csr_offsets: Vec<usize>,
     /// Indices of input nodes in the activations array.
     input_indices: Vec<usize>,
     /// Indices of output nodes in the activations array.
@@ -140,8 +145,33 @@ impl CppnEvaluator {
             .filter_map(|id| node_id_to_idx.get(id).copied())
             .collect();
 
-        // Build adjacency list: incoming connections for each node
-        let mut incoming: Vec<Vec<(usize, f32)>> = vec![Vec::new(); activations.len()];
+        // Build CSR format for incoming connections.
+        // First pass: count incoming connections per node.
+        let num_nodes = activations.len();
+        let mut counts: Vec<usize> = vec![0; num_nodes];
+        for (_, conn) in &genome.connections {
+            if !conn.enabled {
+                continue;
+            }
+            if let Some(&to_idx) = node_id_to_idx.get(&conn.output) {
+                counts[to_idx] += 1;
+            }
+        }
+
+        // Build offsets array (exclusive prefix sum).
+        let mut csr_offsets: Vec<usize> = Vec::with_capacity(num_nodes + 1);
+        csr_offsets.push(0);
+        for &count in &counts {
+            csr_offsets.push(csr_offsets.last().unwrap() + count);
+        }
+
+        // Allocate flat arrays for sources and weights.
+        let total_edges = *csr_offsets.last().unwrap();
+        let mut csr_sources: Vec<usize> = vec![0; total_edges];
+        let mut csr_weights: Vec<f32> = vec![0.0; total_edges];
+
+        // Second pass: fill CSR arrays.
+        let mut write_pos: Vec<usize> = csr_offsets[..num_nodes].to_vec();
         for (_, conn) in &genome.connections {
             if !conn.enabled {
                 continue;
@@ -150,7 +180,10 @@ impl CppnEvaluator {
                 node_id_to_idx.get(&conn.input),
                 node_id_to_idx.get(&conn.output),
             ) {
-                incoming[to_idx].push((from_idx, conn.weight));
+                let pos = write_pos[to_idx];
+                csr_sources[pos] = from_idx;
+                csr_weights[pos] = conn.weight;
+                write_pos[to_idx] += 1;
             }
         }
 
@@ -158,7 +191,9 @@ impl CppnEvaluator {
             activations,
             biases,
             activation_fns,
-            incoming,
+            csr_sources,
+            csr_weights,
+            csr_offsets,
             input_indices,
             output_indices,
             bias_index,
@@ -168,53 +203,79 @@ impl CppnEvaluator {
 
     /// Compute node depths without modifying the genome.
     ///
+    /// Uses Kahn's algorithm for O(V+E) complexity instead of O(V*E) Bellman-Ford.
     /// Returns a HashMap of NodeId -> depth, or an error if cycles are detected.
     fn compute_depths(
         genome: &NeatGenome,
     ) -> Result<std::collections::HashMap<NodeId, u32>, EvaluatorError> {
-        let mut depths: std::collections::HashMap<NodeId, u32> = std::collections::HashMap::new();
+        use std::collections::VecDeque;
 
-        // Initialize depths: inputs/bias at 0
-        for (id, node) in &genome.nodes {
-            let initial_depth = match node.node_type {
-                NodeType::Input | NodeType::Bias => 0,
-                _ => 0, // Will be updated to longest path
-            };
-            depths.insert(id, initial_depth);
+        // Build dense index mapping for efficient array access
+        let node_ids: Vec<NodeId> = genome.nodes.keys().collect();
+        let node_count = node_ids.len();
+        let id_to_idx: std::collections::HashMap<NodeId, usize> = node_ids
+            .iter()
+            .enumerate()
+            .map(|(i, &id)| (id, i))
+            .collect();
+
+        // Build adjacency list (outgoing edges) and compute in-degrees
+        let mut adj: Vec<Vec<usize>> = vec![Vec::new(); node_count];
+        let mut in_degree: Vec<usize> = vec![0; node_count];
+
+        for (_, conn) in &genome.connections {
+            if !conn.enabled {
+                continue;
+            }
+            if let (Some(&from_idx), Some(&to_idx)) =
+                (id_to_idx.get(&conn.input), id_to_idx.get(&conn.output))
+            {
+                adj[from_idx].push(to_idx);
+                in_degree[to_idx] += 1;
+            }
         }
 
-        // Iteratively propagate depths (longest path = max predecessor depth + 1).
-        // Limit iterations to detect cycles.
-        let max_iterations = genome.nodes.len();
-        let mut iterations = 0;
-        let mut changed = true;
+        // Initialize depths and queue sources (nodes with in_degree=0)
+        let mut depths: Vec<u32> = vec![0; node_count];
+        let mut queue: VecDeque<usize> = VecDeque::new();
 
-        while changed && iterations < max_iterations {
-            changed = false;
-            iterations += 1;
+        for (idx, &deg) in in_degree.iter().enumerate() {
+            if deg == 0 {
+                queue.push_back(idx);
+            }
+        }
 
-            for (_, conn) in &genome.connections {
-                if !conn.enabled {
-                    continue;
+        // Process in topological order, computing longest path
+        let mut processed = 0;
+        while let Some(u) = queue.pop_front() {
+            processed += 1;
+            for &v in &adj[u] {
+                // Longest path: depth = max(predecessor depths) + 1
+                let new_depth = depths[u].saturating_add(1);
+                if new_depth > depths[v] {
+                    depths[v] = new_depth;
                 }
-                if let (Some(&input_depth), Some(&output_depth)) =
-                    (depths.get(&conn.input), depths.get(&conn.output))
-                {
-                    let new_depth = input_depth.saturating_add(1);
-                    if new_depth > output_depth {
-                        depths.insert(conn.output, new_depth);
-                        changed = true;
-                    }
+
+                in_degree[v] -= 1;
+                if in_degree[v] == 0 {
+                    queue.push_back(v);
                 }
             }
         }
 
-        // If still changing after max iterations, there's a cycle
-        if changed {
+        // Check for cycles: if not all nodes processed, there's a cycle
+        if processed != node_count {
             return Err(EvaluatorError::CyclicGenome);
         }
 
-        Ok(depths)
+        // Convert to HashMap for return
+        let result: std::collections::HashMap<NodeId, u32> = node_ids
+            .iter()
+            .enumerate()
+            .map(|(idx, &id)| (id, depths[idx]))
+            .collect();
+
+        Ok(result)
     }
 
     /// Evaluate the network with given inputs, writing results to a provided buffer.
@@ -260,11 +321,16 @@ impl CppnEvaluator {
             self.activations[bias_idx] = 1.0;
         }
 
-        // Forward propagation in topological order - O(N+E) using adjacency list
+        // Forward propagation in topological order - O(N+E) using CSR format.
+        // CSR enables contiguous memory access for optimal cache performance.
         for &node_idx in &self.eval_order {
-            // Sum incoming connections from adjacency list
+            // Sum incoming connections from CSR arrays
             let mut sum = self.biases[node_idx];
-            for &(from_idx, weight) in &self.incoming[node_idx] {
+            let start = self.csr_offsets[node_idx];
+            let end = self.csr_offsets[node_idx + 1];
+            for i in start..end {
+                let from_idx = self.csr_sources[i];
+                let weight = self.csr_weights[i];
                 sum += self.activations[from_idx] * weight;
             }
 

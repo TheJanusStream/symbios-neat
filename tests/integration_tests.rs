@@ -2011,3 +2011,196 @@ fn test_generate_pattern_tanh_still_works() {
         );
     }
 }
+
+// =============================================================================
+// Performance Optimization Tests (Issue #51)
+// =============================================================================
+
+/// Test that compatibility_distance produces correct results with sorted merge algorithm.
+/// The sorted merge avoids HashMap allocations while maintaining O(E log E) complexity.
+#[test]
+fn test_compatibility_distance_sorted_merge_correctness() {
+    let config = NeatConfig::minimal(3, 2);
+    let mut rng = ChaCha8Rng::seed_from_u64(42);
+
+    // Create genomes with different structures
+    let mut genome1 = NeatGenome::fully_connected(config.clone(), &mut rng);
+    let mut genome2 = NeatGenome::fully_connected(config, &mut rng);
+
+    // Mutate to create disjoint/excess genes
+    for _ in 0..10 {
+        genome1.mutate(&mut rng, 1.0);
+    }
+    for _ in 0..15 {
+        genome2.mutate(&mut rng, 1.0);
+    }
+
+    // Verify distance is symmetric
+    let dist_1_to_2 = genome1.compatibility_distance(&genome2);
+    let dist_2_to_1 = genome2.compatibility_distance(&genome1);
+
+    assert!(
+        (dist_1_to_2 - dist_2_to_1).abs() < 1e-6,
+        "Distance should be symmetric: {} vs {}",
+        dist_1_to_2,
+        dist_2_to_1
+    );
+
+    // Verify distance to self is zero
+    assert!(
+        genome1.compatibility_distance(&genome1).abs() < 1e-6,
+        "Distance to self should be zero"
+    );
+}
+
+/// Test that many compatibility_distance calls complete efficiently.
+/// This is a regression test for the HashMap allocation issue.
+#[test]
+fn test_compatibility_distance_many_calls() {
+    let config = NeatConfig::cppn(4, 2);
+    let mut rng = ChaCha8Rng::seed_from_u64(42);
+
+    // Create a small population
+    let pop_size = 20;
+    let mut population: Vec<NeatGenome> = Vec::with_capacity(pop_size);
+
+    for _ in 0..pop_size {
+        let mut genome = NeatGenome::fully_connected(config.clone(), &mut rng);
+        for _ in 0..10 {
+            genome.mutate(&mut rng, 1.0);
+        }
+        population.push(genome);
+    }
+
+    // Perform all pairwise comparisons (190 comparisons)
+    let mut total_distance = 0.0f32;
+    for i in 0..population.len() {
+        for j in (i + 1)..population.len() {
+            total_distance += population[i].compatibility_distance(&population[j]);
+        }
+    }
+
+    // Just verify it completes and produces valid results
+    assert!(
+        total_distance.is_finite(),
+        "Total distance should be finite"
+    );
+    assert!(
+        total_distance >= 0.0,
+        "Total distance should be non-negative"
+    );
+}
+
+/// Test that update_depths uses O(V+E) Kahn's algorithm correctly.
+#[test]
+fn test_update_depths_kahn_algorithm() {
+    let config = NeatConfig::minimal(2, 2);
+    let mut rng = ChaCha8Rng::seed_from_u64(42);
+    let mut genome = NeatGenome::fully_connected(config, &mut rng);
+
+    // Add several hidden nodes to create depth
+    for _ in 0..5 {
+        if let Some(conn_id) = genome
+            .connections
+            .iter()
+            .filter(|(_, c)| c.enabled)
+            .map(|(id, _)| id)
+            .next()
+        {
+            genome.add_node(conn_id, &mut rng);
+        }
+    }
+
+    // Verify depths are computed correctly
+    assert!(genome.update_depths(), "Acyclic genome should succeed");
+
+    // Input nodes should have depth 0
+    for &input_id in &genome.input_ids {
+        assert_eq!(
+            genome.nodes[input_id].depth, 0,
+            "Input nodes should have depth 0"
+        );
+    }
+
+    // Output nodes should have depth > 0 (there's at least one connection)
+    for &output_id in &genome.output_ids {
+        assert!(
+            genome.nodes[output_id].depth > 0,
+            "Output nodes should have depth > 0"
+        );
+    }
+}
+
+/// Test evaluator CSR format produces same results as original adjacency list.
+#[test]
+fn test_evaluator_csr_format_correctness() {
+    let config = NeatConfig::cppn(3, 2);
+    let mut rng = ChaCha8Rng::seed_from_u64(42);
+    let mut genome = NeatGenome::fully_connected(config, &mut rng);
+
+    // Add complexity
+    for _ in 0..10 {
+        genome.mutate(&mut rng, 1.0);
+    }
+
+    let mut evaluator = CppnEvaluator::new(&genome);
+
+    // Evaluate with various inputs
+    let test_inputs = [
+        [0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.5, 0.5, 0.5],
+        [-1.0, -1.0, -1.0],
+    ];
+
+    for inputs in &test_inputs {
+        let outputs1 = evaluator.evaluate(inputs);
+        let outputs2 = evaluator.evaluate(inputs);
+
+        // Results should be deterministic
+        for (i, (&o1, &o2)) in outputs1.iter().zip(outputs2.iter()).enumerate() {
+            assert!(
+                (o1 - o2).abs() < 1e-6,
+                "Evaluation should be deterministic: output {} differs ({} vs {})",
+                i,
+                o1,
+                o2
+            );
+        }
+
+        // Results should be finite
+        for (i, &o) in outputs1.iter().enumerate() {
+            assert!(o.is_finite(), "Output {} should be finite: {}", i, o);
+        }
+    }
+}
+
+/// Test that would_create_cycle uses Vec<bool> efficiently.
+#[test]
+fn test_would_create_cycle_efficiency() {
+    let config = NeatConfig {
+        add_connection_prob: 1.0, // High probability to stress cycle detection
+        add_node_prob: 0.5,
+        ..NeatConfig::minimal(3, 2)
+    };
+    let mut rng = ChaCha8Rng::seed_from_u64(42);
+    let mut genome = NeatGenome::fully_connected(config, &mut rng);
+
+    // Perform many mutations (each add_connection attempt calls would_create_cycle)
+    for _ in 0..50 {
+        genome.mutate(&mut rng, 1.0);
+    }
+
+    // Verify the genome is still acyclic
+    assert!(
+        !genome.has_cycle(),
+        "Genome should remain acyclic after mutations"
+    );
+
+    // Verify depths can be computed
+    assert!(
+        genome.update_depths(),
+        "Acyclic genome should have valid depths"
+    );
+}

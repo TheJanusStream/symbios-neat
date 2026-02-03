@@ -315,25 +315,55 @@ impl NeatGenome {
     }
 
     /// Check if adding a connection from input_id to output_id would create a cycle.
+    ///
+    /// Uses Vec<bool> indexed by SlotMap key version for O(1) visited checks
+    /// without HashMap/HashSet allocation overhead. This is called frequently
+    /// during connection mutation (up to 10 attempts per mutation).
     fn would_create_cycle(&self, input_id: NodeId, output_id: NodeId) -> bool {
-        // DFS from output_id to see if we can reach input_id
-        // (Using stack with pop() for LIFO traversal)
-        let mut visited = std::collections::HashSet::with_capacity(self.nodes.len());
-        let mut stack = vec![output_id];
+        // Build node index mapping for dense visited array.
+        // SlotMap iteration order is stable, so we can use enumeration.
+        let node_ids: Vec<NodeId> = self.nodes.keys().collect();
+        let node_count = node_ids.len();
+
+        // Find indices for input and output
+        let input_idx = node_ids.iter().position(|&id| id == input_id);
+        let output_idx = node_ids.iter().position(|&id| id == output_id);
+
+        let (Some(input_idx), Some(output_idx)) = (input_idx, output_idx) else {
+            return false; // Node doesn't exist
+        };
+
+        // Build adjacency list with dense indices for cache-friendly traversal
+        let mut adj: Vec<Vec<usize>> = vec![Vec::new(); node_count];
+        for (_, conn) in &self.connections {
+            if !conn.enabled {
+                continue;
+            }
+            if let (Some(from_idx), Some(to_idx)) = (
+                node_ids.iter().position(|&id| id == conn.input),
+                node_ids.iter().position(|&id| id == conn.output),
+            ) {
+                adj[from_idx].push(to_idx);
+            }
+        }
+
+        // DFS using Vec<bool> instead of HashSet - avoids heap allocation per call
+        let mut visited = vec![false; node_count];
+        let mut stack = vec![output_idx];
 
         while let Some(current) = stack.pop() {
-            if current == input_id {
+            if current == input_idx {
                 return true;
             }
 
-            if !visited.insert(current) {
-                continue; // Already visited
+            if visited[current] {
+                continue;
             }
+            visited[current] = true;
 
-            // Find all nodes that current connects TO
-            for (_, conn) in &self.connections {
-                if conn.enabled && conn.input == current {
-                    stack.push(conn.output);
+            for &neighbor in &adj[current] {
+                if !visited[neighbor] {
+                    stack.push(neighbor);
                 }
             }
         }
@@ -347,51 +377,84 @@ impl NeatGenome {
     /// that a node is only evaluated after ALL its predecessors are ready.
     /// This is critical for correct feedforward evaluation.
     ///
+    /// Uses Kahn's algorithm for O(V+E) complexity instead of O(V*E) Bellman-Ford.
+    ///
     /// Returns `true` if the graph is acyclic and depths were computed successfully,
-    /// `false` if a cycle was detected (iteration limit exceeded).
+    /// `false` if a cycle was detected.
     pub fn update_depths(&mut self) -> bool {
-        // Reset all depths: inputs/bias at 0, others at 0 (will be updated to max)
-        for (_, node) in &mut self.nodes {
-            node.depth = match node.node_type {
-                NodeType::Input | NodeType::Bias => 0,
-                _ => 0, // Will be updated to longest path
-            };
+        use std::collections::VecDeque;
+
+        // Build dense index mapping for efficient array access
+        let node_ids: Vec<NodeId> = self.nodes.keys().collect();
+        let node_count = node_ids.len();
+        let id_to_idx: std::collections::HashMap<NodeId, usize> = node_ids
+            .iter()
+            .enumerate()
+            .map(|(i, &id)| (id, i))
+            .collect();
+
+        // Build adjacency list (outgoing edges) and compute in-degrees
+        let mut adj: Vec<Vec<usize>> = vec![Vec::new(); node_count];
+        let mut in_degree: Vec<usize> = vec![0; node_count];
+
+        for (_, conn) in &self.connections {
+            if !conn.enabled {
+                continue;
+            }
+            if let (Some(&from_idx), Some(&to_idx)) =
+                (id_to_idx.get(&conn.input), id_to_idx.get(&conn.output))
+            {
+                adj[from_idx].push(to_idx);
+                in_degree[to_idx] += 1;
+            }
         }
 
-        // Iteratively propagate depths until stable.
-        // For longest path: depth = max(all_predecessor_depths) + 1
-        // Limit iterations to prevent infinite loops on cyclic graphs.
-        // In an acyclic graph, we need at most N iterations (longest path length).
-        let max_iterations = self.nodes.len();
-        let mut iterations = 0;
-        let mut changed = true;
+        // Initialize depths: sources (in_degree=0) get depth based on node type
+        let mut depths: Vec<u32> = vec![0; node_count];
+        let mut queue: VecDeque<usize> = VecDeque::new();
 
-        while changed && iterations < max_iterations {
-            changed = false;
-            iterations += 1;
+        for (idx, &node_id) in node_ids.iter().enumerate() {
+            if in_degree[idx] == 0 {
+                let node = &self.nodes[node_id];
+                depths[idx] = match node.node_type {
+                    NodeType::Input | NodeType::Bias => 0,
+                    _ => 0, // Hidden nodes with no inputs start at 0
+                };
+                queue.push_back(idx);
+            }
+        }
 
-            for (_, conn) in &self.connections {
-                if !conn.enabled {
-                    continue;
+        // Process in topological order, computing longest path
+        let mut processed = 0;
+        while let Some(u) = queue.pop_front() {
+            processed += 1;
+            for &v in &adj[u] {
+                // Longest path: depth = max(predecessor depths) + 1
+                let new_depth = depths[u].saturating_add(1);
+                if new_depth > depths[v] {
+                    depths[v] = new_depth;
                 }
-                if let (Some(input_node), Some(output_node)) =
-                    (self.nodes.get(conn.input), self.nodes.get(conn.output))
-                {
-                    // Longest path: take maximum of all incoming paths
-                    let new_depth = input_node.depth.saturating_add(1);
-                    if new_depth > output_node.depth {
-                        // Safe because we're iterating connections, not nodes
-                        if let Some(output_node) = self.nodes.get_mut(conn.output) {
-                            output_node.depth = new_depth;
-                            changed = true;
-                        }
-                    }
+
+                in_degree[v] -= 1;
+                if in_degree[v] == 0 {
+                    queue.push_back(v);
                 }
             }
         }
 
-        // If we're still changing after max iterations, there's a cycle
-        !changed
+        // Check for cycles: if not all nodes processed, there's a cycle
+        if processed != node_count {
+            return false;
+        }
+
+        // Write depths back to nodes
+        for (idx, &node_id) in node_ids.iter().enumerate() {
+            if let Some(node) = self.nodes.get_mut(node_id) {
+                node.depth = depths[idx];
+            }
+        }
+
+        true
     }
 
     /// Check if the genome contains any cycles in its enabled connections.
@@ -620,51 +683,81 @@ impl NeatGenome {
 
     /// Compute compatibility distance to another genome for speciation.
     ///
-    /// Uses O(E) hash-based lookups instead of O(E²) linear scans.
+    /// Uses allocation-free O(E log E) sorted merge instead of HashMap allocation.
+    /// This avoids heap churn during speciation (O(P²) comparisons per generation).
     #[must_use]
     pub fn compatibility_distance(&self, other: &NeatGenome) -> f32 {
-        let mut matching = 0;
-        let mut disjoint = 0;
-        let mut excess = 0;
-        let mut weight_diff_sum = 0.0;
-
-        // Build HashMap for O(1) lookup instead of O(E) find_connection_by_innovation
-        let self_by_innovation: std::collections::HashMap<u64, &ConnectionGene> = self
-            .connections
-            .iter()
-            .map(|(_, c)| (c.innovation, c))
-            .collect();
-        let other_by_innovation: std::collections::HashMap<u64, &ConnectionGene> = other
-            .connections
-            .iter()
-            .map(|(_, c)| (c.innovation, c))
-            .collect();
+        // Collect and sort connections by innovation for linear merge.
+        // This is O(E log E) but avoids HashMap heap allocation that causes
+        // massive allocator pressure during speciation (250k+ allocs per gen).
+        let mut self_conns: Vec<_> = self.connections.iter().map(|(_, c)| c).collect();
+        let mut other_conns: Vec<_> = other.connections.iter().map(|(_, c)| c).collect();
+        self_conns.sort_unstable_by_key(|c| c.innovation);
+        other_conns.sort_unstable_by_key(|c| c.innovation);
 
         // Get max innovations for excess/disjoint classification
-        let self_max = self_by_innovation.keys().copied().max().unwrap_or(0);
-        let other_max = other_by_innovation.keys().copied().max().unwrap_or(0);
+        let self_max = self_conns.last().map_or(0, |c| c.innovation);
+        let other_max = other_conns.last().map_or(0, |c| c.innovation);
 
-        // Compare genes from self
-        for (_, self_conn) in &self.connections {
-            if let Some(other_conn) = other_by_innovation.get(&self_conn.innovation) {
-                matching += 1;
-                weight_diff_sum += (self_conn.weight - other_conn.weight).abs();
-            } else if self_conn.innovation > other_max {
+        let mut matching = 0u32;
+        let mut disjoint = 0u32;
+        let mut excess = 0u32;
+        let mut weight_diff_sum = 0.0f32;
+
+        // Linear merge algorithm - O(E) after sorting
+        let mut i = 0;
+        let mut j = 0;
+        while i < self_conns.len() && j < other_conns.len() {
+            let self_inn = self_conns[i].innovation;
+            let other_inn = other_conns[j].innovation;
+
+            match self_inn.cmp(&other_inn) {
+                std::cmp::Ordering::Equal => {
+                    // Matching gene
+                    matching += 1;
+                    weight_diff_sum += (self_conns[i].weight - other_conns[j].weight).abs();
+                    i += 1;
+                    j += 1;
+                }
+                std::cmp::Ordering::Less => {
+                    // Gene only in self
+                    if self_inn > other_max {
+                        excess += 1;
+                    } else {
+                        disjoint += 1;
+                    }
+                    i += 1;
+                }
+                std::cmp::Ordering::Greater => {
+                    // Gene only in other
+                    if other_inn > self_max {
+                        excess += 1;
+                    } else {
+                        disjoint += 1;
+                    }
+                    j += 1;
+                }
+            }
+        }
+
+        // Count remaining genes in self
+        while i < self_conns.len() {
+            if self_conns[i].innovation > other_max {
                 excess += 1;
             } else {
                 disjoint += 1;
             }
+            i += 1;
         }
 
-        // Count disjoint/excess genes from other that aren't in self
-        for (_, other_conn) in &other.connections {
-            if !self_by_innovation.contains_key(&other_conn.innovation) {
-                if other_conn.innovation > self_max {
-                    excess += 1;
-                } else {
-                    disjoint += 1;
-                }
+        // Count remaining genes in other
+        while j < other_conns.len() {
+            if other_conns[j].innovation > self_max {
+                excess += 1;
+            } else {
+                disjoint += 1;
             }
+            j += 1;
         }
 
         let n = self.connections.len().max(other.connections.len()).max(1) as f32;

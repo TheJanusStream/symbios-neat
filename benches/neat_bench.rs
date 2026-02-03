@@ -104,6 +104,77 @@ fn bench_compatibility_distance(c: &mut Criterion) {
     });
 }
 
+/// Benchmark speciation-like workload: O(N²) compatibility comparisons.
+/// This simulates what happens during speciation in a real NEAT population.
+fn bench_speciation_workload(c: &mut Criterion) {
+    let config = NeatConfig {
+        add_connection_prob: 0.3,
+        add_node_prob: 0.1,
+        ..NeatConfig::cppn(4, 2)
+    };
+    let mut rng = ChaCha8Rng::seed_from_u64(42);
+
+    // Create a small "population" of diverged genomes
+    let pop_size = 50; // 50 genomes = 1225 comparisons
+    let mut population: Vec<NeatGenome> = Vec::with_capacity(pop_size);
+
+    for _ in 0..pop_size {
+        let mut genome = NeatGenome::fully_connected(config.clone(), &mut rng);
+        for _ in 0..15 {
+            genome.mutate(&mut rng, 1.0);
+        }
+        population.push(genome);
+    }
+
+    c.bench_function("speciation_50_genomes", |b| {
+        b.iter(|| {
+            let mut total_distance = 0.0f32;
+            for i in 0..population.len() {
+                for j in (i + 1)..population.len() {
+                    total_distance += population[i].compatibility_distance(&population[j]);
+                }
+            }
+            black_box(total_distance)
+        });
+    });
+}
+
+/// Benchmark evaluator construction (includes depth computation).
+fn bench_evaluator_construction(c: &mut Criterion) {
+    let config = NeatConfig::cppn(4, 2);
+    let mut rng = ChaCha8Rng::seed_from_u64(42);
+    let mut genome = NeatGenome::fully_connected(config, &mut rng);
+
+    // Build a moderately complex network
+    for _ in 0..20 {
+        genome.mutate(&mut rng, 1.0);
+    }
+
+    c.bench_function("evaluator_construction", |b| {
+        b.iter(|| {
+            black_box(CppnEvaluator::new(&genome));
+        });
+    });
+}
+
+/// Benchmark update_depths (now uses O(V+E) Kahn's algorithm).
+fn bench_update_depths(c: &mut Criterion) {
+    let config = NeatConfig::cppn(4, 2);
+    let mut rng = ChaCha8Rng::seed_from_u64(42);
+    let mut genome = NeatGenome::fully_connected(config, &mut rng);
+
+    // Build a deep network
+    for _ in 0..30 {
+        genome.mutate(&mut rng, 1.0);
+    }
+
+    c.bench_function("update_depths", |b| {
+        b.iter(|| {
+            black_box(genome.update_depths());
+        });
+    });
+}
+
 criterion_group!(
     benches,
     bench_genome_creation,
@@ -111,5 +182,8 @@ criterion_group!(
     bench_crossover,
     bench_evaluation,
     bench_compatibility_distance,
+    bench_speciation_workload,
+    bench_evaluator_construction,
+    bench_update_depths,
 );
 criterion_main!(benches);
