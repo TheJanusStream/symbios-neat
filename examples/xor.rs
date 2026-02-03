@@ -18,7 +18,7 @@ struct XorFitness;
 
 impl Evaluator<NeatGenome> for XorFitness {
     fn evaluate(&self, genome: &NeatGenome) -> (f32, Vec<f32>, Vec<f32>) {
-        let mut evaluator = CppnEvaluator::new(genome);
+        let evaluator = CppnEvaluator::new(genome);
         let mut total_error = 0.0;
 
         // XOR truth table
@@ -142,7 +142,7 @@ fn main() {
 
     // Test the champion
     println!("\nChampion XOR outputs:");
-    let mut eval = CppnEvaluator::new(&champion.genotype);
+    let eval = CppnEvaluator::new(&champion.genotype);
 
     let test_cases = [
         ([0.0_f32, 0.0], 0.0_f32),

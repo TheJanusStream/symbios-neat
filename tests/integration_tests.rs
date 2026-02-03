@@ -42,7 +42,7 @@ fn test_evaluator_preserves_input_output_order_after_crossover() {
     assert_eq!(child.output_ids.len(), 2, "Child should have 2 outputs");
 
     // Create evaluator and verify it respects semantic ordering
-    let mut evaluator = CppnEvaluator::new(&child);
+    let evaluator = CppnEvaluator::new(&child);
 
     // Evaluate with distinct inputs [1.0, 0.0] and [0.0, 1.0]
     // If input mapping is correct, these should produce different outputs
@@ -76,7 +76,7 @@ fn test_evaluator_preserves_order_after_serialization() {
     }
 
     // Evaluate original
-    let mut eval1 = CppnEvaluator::new(&genome);
+    let eval1 = CppnEvaluator::new(&genome);
     let inputs = [0.5, -0.3, 0.8];
     let output_before = eval1.evaluate(&inputs);
 
@@ -89,7 +89,7 @@ fn test_evaluator_preserves_order_after_serialization() {
     assert_eq!(genome.output_ids.len(), restored.output_ids.len());
 
     // Evaluate restored - should produce identical results
-    let mut eval2 = CppnEvaluator::new(&restored);
+    let eval2 = CppnEvaluator::new(&restored);
     let output_after = eval2.evaluate(&inputs);
 
     for (i, (&before, &after)) in output_before.iter().zip(output_after.iter()).enumerate() {
@@ -337,7 +337,7 @@ fn test_network_no_overflow_with_large_weights() {
         }
     }
 
-    let mut evaluator = CppnEvaluator::new(&genome);
+    let evaluator = CppnEvaluator::new(&genome);
     let output = evaluator.evaluate(&[100.0, 100.0]);
 
     // Output should be finite, not overflow to infinity
@@ -567,7 +567,7 @@ fn test_crossover_acyclic() {
         );
 
         // Verify the child can be evaluated without hanging
-        let mut evaluator = CppnEvaluator::new(&child);
+        let evaluator = CppnEvaluator::new(&child);
         let output = evaluator.evaluate(&[0.5, 0.5]);
         assert!(output[0].is_finite(), "Child should produce finite output");
     }
@@ -604,13 +604,14 @@ fn test_evaluate_into_matches_evaluate() {
         genome.mutate(&mut rng, 1.0);
     }
 
-    let mut evaluator = CppnEvaluator::new(&genome);
+    let evaluator = CppnEvaluator::new(&genome);
 
     let inputs = [0.5, -0.3, 0.8];
     let outputs_vec = evaluator.evaluate(&inputs);
 
+    let mut scratch = evaluator.create_scratchpad();
     let mut outputs_buf = [0.0f32; 2];
-    evaluator.evaluate_into(&inputs, &mut outputs_buf);
+    evaluator.evaluate_into(&inputs, &mut outputs_buf, &mut scratch);
 
     assert!(
         (outputs_vec[0] - outputs_buf[0]).abs() < 1e-6,
@@ -663,7 +664,7 @@ fn test_large_scale_evolution_stability() {
                 i
             );
 
-            let mut evaluator = CppnEvaluator::new(genome);
+            let evaluator = CppnEvaluator::new(genome);
             let output = evaluator.evaluate(&[0.1, 0.2, 0.3, 0.4]);
             for (j, &val) in output.iter().enumerate() {
                 assert!(
@@ -717,7 +718,7 @@ fn test_full_evolution_cycle() {
 
     // Verify population is still valid
     for genome in &population {
-        let mut evaluator = CppnEvaluator::new(genome);
+        let evaluator = CppnEvaluator::new(genome);
         let output = evaluator.evaluate(&[0.5, 0.5]);
         assert_eq!(output.len(), 1);
         assert!(output[0].is_finite());
@@ -761,7 +762,7 @@ fn test_extreme_weight_range_handled() {
 
     // Weights might be infinite due to overflow, but the code shouldn't panic
     // and the evaluator should still work (activation functions clamp infinity)
-    let mut evaluator = CppnEvaluator::new(&genome);
+    let evaluator = CppnEvaluator::new(&genome);
     let output = evaluator.evaluate(&[0.5, 0.5]);
 
     // Output should be finite because activation functions clamp extreme values
@@ -1232,7 +1233,7 @@ fn test_evaluator_handles_stale_depths() {
     }
 
     // The evaluator should still work correctly because it recomputes depths
-    let mut evaluator = CppnEvaluator::new(&genome);
+    let evaluator = CppnEvaluator::new(&genome);
     let output = evaluator.evaluate(&[1.0, 2.0]);
 
     // With correct depth computation: output = input0 + input1 = 3.0
@@ -1263,7 +1264,7 @@ fn test_evaluation_order_respects_dependencies() {
 
     // Initial network: input0 + input1 -> output
     // With identity activation and weights 1.0: output = input0 + input1
-    let mut evaluator = CppnEvaluator::new(&genome);
+    let evaluator = CppnEvaluator::new(&genome);
     let output = evaluator.evaluate(&[1.0, 2.0]);
     assert!(
         (output[0] - 3.0).abs() < 1e-5,
@@ -1286,7 +1287,7 @@ fn test_evaluation_order_respects_dependencies() {
         }
     }
 
-    let mut evaluator = CppnEvaluator::new(&genome);
+    let evaluator = CppnEvaluator::new(&genome);
     let output = evaluator.evaluate(&[1.0, 2.0]);
 
     // If depth is wrong, hidden might not be evaluated before output
@@ -1310,7 +1311,7 @@ fn test_serialization_preserves_behavior() {
     }
 
     // Evaluate original
-    let mut eval1 = CppnEvaluator::new(&genome);
+    let eval1 = CppnEvaluator::new(&genome);
     let output1 = eval1.query_2d(0.5, -0.3);
 
     // Serialize and deserialize
@@ -1318,7 +1319,7 @@ fn test_serialization_preserves_behavior() {
     let restored: NeatGenome = serde_json::from_str(&json).unwrap();
 
     // Evaluate restored
-    let mut eval2 = CppnEvaluator::new(&restored);
+    let eval2 = CppnEvaluator::new(&restored);
     let output2 = eval2.query_2d(0.5, -0.3);
 
     // Outputs should match
@@ -1362,7 +1363,7 @@ fn test_all_activation_functions_work() {
         let mut rng = ChaCha8Rng::seed_from_u64(42);
         let genome = NeatGenome::fully_connected(config, &mut rng);
 
-        let mut evaluator = CppnEvaluator::new(&genome);
+        let evaluator = CppnEvaluator::new(&genome);
         let output = evaluator.evaluate(&[0.5]);
 
         assert!(
@@ -1605,7 +1606,7 @@ fn test_deep_network_evaluation_after_fixes() {
         "Deep acyclic genome should create evaluator"
     );
 
-    let mut evaluator = result.unwrap();
+    let evaluator = result.unwrap();
     let output = evaluator.evaluate(&[0.5, -0.5]);
 
     assert!(
@@ -1663,7 +1664,7 @@ fn test_precision_preserved_with_reduced_clamp_bound() {
         conn.weight = 100.0;
     }
 
-    let mut evaluator = CppnEvaluator::new(&genome);
+    let evaluator = CppnEvaluator::new(&genome);
 
     // Test with small input values (0.001)
     // With old 1e6 clamp: sum could reach 1e12, losing precision for small signals
@@ -2143,7 +2144,7 @@ fn test_evaluator_csr_format_correctness() {
         genome.mutate(&mut rng, 1.0);
     }
 
-    let mut evaluator = CppnEvaluator::new(&genome);
+    let evaluator = CppnEvaluator::new(&genome);
 
     // Evaluate with various inputs
     let test_inputs = [

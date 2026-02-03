@@ -102,7 +102,9 @@ pub mod topology;
 
 // Re-exports for convenience
 pub use activation::Activation;
-pub use evaluator::{generate_pattern, CppnEvaluator, EvaluatorError, PatternError};
+pub use evaluator::{
+    generate_pattern, CppnEvaluator, EvalScratchpad, EvaluatorError, PatternError,
+};
 pub use gene::{ConnectionGene, ConnectionId, NodeGene, NodeId, NodeType};
 pub use genome::{NeatConfig, NeatGenome};
 pub use innovation::{
