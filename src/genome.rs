@@ -217,6 +217,106 @@ impl NeatGenome {
         genome
     }
 
+    /// Resize the network's input/output layer to match a new topology,
+    /// preserving all existing hidden nodes and as many connections as possible.
+    ///
+    /// New input/output nodes are created with proper innovation numbers.
+    /// Connections to/from removed nodes are pruned. New inputs are connected
+    /// to all existing outputs (and vice versa) with random weights so the
+    /// network remains functional rather than disconnected.
+    ///
+    /// This avoids the "lobotomy" problem where a topology change forces a
+    /// full network reset, destroying all learned weights.
+    pub fn resize_io<R: Rng>(&mut self, num_inputs: usize, num_outputs: usize, rng: &mut R) {
+        let old_num_inputs = self.input_ids.len();
+        let old_num_outputs = self.output_ids.len();
+
+        if num_inputs == old_num_inputs && num_outputs == old_num_outputs {
+            return;
+        }
+
+        // --- Remove excess inputs ---
+        while self.input_ids.len() > num_inputs {
+            let removed_id = self.input_ids.pop().unwrap();
+            self.nodes.remove(removed_id);
+            // Prune connections from this input
+            self.connections
+                .retain(|_, conn| conn.input != removed_id && conn.output != removed_id);
+        }
+
+        // --- Remove excess outputs ---
+        while self.output_ids.len() > num_outputs {
+            let removed_id = self.output_ids.pop().unwrap();
+            self.nodes.remove(removed_id);
+            self.connections
+                .retain(|_, conn| conn.input != removed_id && conn.output != removed_id);
+        }
+
+        // --- Add new inputs ---
+        let mut new_input_ids = Vec::new();
+        for i in old_num_inputs..num_inputs {
+            let innovation = (i + 1) as u64;
+            let id = self.nodes.insert(NodeGene::input(innovation));
+            self.input_ids.push(id);
+            new_input_ids.push(id);
+        }
+
+        // --- Add new outputs ---
+        let output_start = num_inputs + 1;
+        let mut new_output_ids = Vec::new();
+        for i in old_num_outputs..num_outputs {
+            let innovation = (output_start + i) as u64;
+            let id = self
+                .nodes
+                .insert(NodeGene::output(innovation, self.config.output_activation));
+            self.output_ids.push(id);
+            new_output_ids.push(id);
+        }
+
+        // --- Wire new inputs to all existing outputs ---
+        for &input_id in &new_input_ids {
+            for &output_id in &self.output_ids {
+                let input_inn = self.nodes[input_id].innovation;
+                let output_inn = self.nodes[output_id].innovation;
+                let conn_inn = connection_innovation(input_inn, output_inn);
+                let weight = Self::random_weight(rng, self.config.weight_range);
+                self.connections
+                    .insert(ConnectionGene::new(conn_inn, input_id, output_id, weight));
+            }
+        }
+
+        // --- Wire all existing inputs to new outputs ---
+        for &output_id in &new_output_ids {
+            for &input_id in &self.input_ids {
+                // Skip inputs we just connected above
+                if new_input_ids.contains(&input_id) {
+                    continue;
+                }
+                let input_inn = self.nodes[input_id].innovation;
+                let output_inn = self.nodes[output_id].innovation;
+                let conn_inn = connection_innovation(input_inn, output_inn);
+                let weight = Self::random_weight(rng, self.config.weight_range);
+                self.connections
+                    .insert(ConnectionGene::new(conn_inn, input_id, output_id, weight));
+            }
+            // Also connect bias to new outputs
+            if let Some(bias_id) = self.bias_id {
+                let bias_inn = self.nodes[bias_id].innovation;
+                let output_inn = self.nodes[output_id].innovation;
+                let conn_inn = connection_innovation(bias_inn, output_inn);
+                let weight = Self::random_weight(rng, self.config.weight_range);
+                self.connections
+                    .insert(ConnectionGene::new(conn_inn, bias_id, output_id, weight));
+            }
+        }
+
+        // Update config to reflect new topology
+        self.config.num_inputs = num_inputs;
+        self.config.num_outputs = num_outputs;
+
+        self.update_depths();
+    }
+
     /// Add a new connection between two nodes.
     ///
     /// Returns `None` if the connection would create a cycle or already exists.

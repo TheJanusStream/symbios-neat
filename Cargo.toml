@@ -6,11 +6,17 @@ authors = ["Janus"]
 description = "NEAT engine for morphogenetic engineering with CPPN support"
 license = "MIT"
 repository = "https://github.com/codewright/symbios-neat"
-keywords = ["neat", "neuroevolution", "cppn", "genetic-algorithm", "neural-network"]
+keywords = [
+    "neat",
+    "neuroevolution",
+    "cppn",
+    "genetic-algorithm",
+    "neural-network",
+]
 categories = ["science", "algorithms", "simulation"]
 
 [dependencies]
-symbios-genetics = "0.1.1"
+symbios-genetics = { version = "0.1", path = "../symbios-genetics" }
 serde = { version = "1.0", features = ["derive"] }
 rand = "0.9"
 slotmap = { version = "1.0", features = ["serde"] }
