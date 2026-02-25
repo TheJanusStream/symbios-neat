@@ -6,3 +6,4 @@ Cargo.lock
 CHANGELOG.md
 symbios-neat-primer.sh
 symbios_neat_primer_*
+.mcp.json
