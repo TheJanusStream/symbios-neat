@@ -1,11 +1,11 @@
 [package]
 name = "symbios-neat"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 authors = ["Janus"]
 description = "NEAT engine for morphogenetic engineering with CPPN support"
 license = "MIT"
-repository = "https://github.com/codewright/symbios-neat"
+repository = "https://github.com/TheJanusStream/symbios-neat"
 keywords = [
     "neat",
     "neuroevolution",
