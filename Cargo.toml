@@ -1,6 +1,6 @@
 [package]
 name = "symbios-neat"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
 authors = ["Janus"]
 description = "NEAT engine for morphogenetic engineering with CPPN support"
@@ -16,10 +16,11 @@ keywords = [
 categories = ["science", "algorithms", "simulation"]
 
 [dependencies]
-symbios-genetics = "0.1"
+symbios-genetics = {path="../symbios-genetics"}
 serde = { version = "1.0", features = ["derive"] }
 rand = "0.9"
 slotmap = { version = "1.0", features = ["serde"] }
+image = { version = "0.25", optional = true, default-features = false, features = ["png"] }
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }
@@ -32,3 +33,7 @@ harness = false
 
 [features]
 default = []
+
+# Enable PNG export via [`CppnEvaluator::generate_image`]. Pulls in the `image`
+# crate; PNG codec only.
+image = ["dep:image"]

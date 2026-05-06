@@ -31,8 +31,9 @@ let config = NeatConfig::cppn(2, 1);
 let mut rng = ChaCha8Rng::seed_from_u64(42);
 let genome = NeatGenome::fully_connected(config, &mut rng);
 
-// Compile and evaluate
-let mut evaluator = CppnEvaluator::new(&genome);
+// Compile and evaluate. `new` returns `Result<_, EvaluatorError>` —
+// it errors on cyclic genomes; call `genome.break_cycles()` first if needed.
+let evaluator = CppnEvaluator::new(&genome).expect("acyclic genome");
 let output = evaluator.query_2d(0.5, -0.5);
 println!("Output: {:?}", output);
 ```
@@ -48,7 +49,10 @@ struct XorFitness;
 
 impl Evaluator<NeatGenome> for XorFitness {
     fn evaluate(&self, genome: &NeatGenome) -> (f32, Vec<f32>, Vec<f32>) {
-        let mut eval = CppnEvaluator::new(genome);
+        // CppnEvaluator::new errors on cyclic genomes; assign worst fitness in that case.
+        let Ok(eval) = CppnEvaluator::new(genome) else {
+            return (0.0, vec![0.0], vec![]);
+        };
         let mut error = 0.0;
 
         // XOR truth table
@@ -80,6 +84,62 @@ for _ in 0..100 {
 }
 ```
 
+## Pattern, Voxel, and Image Export
+
+A trained CPPN can be queried over a grid of coordinates to produce 2D
+patterns or 3D voxel grids:
+
+```rust,ignore
+let evaluator = CppnEvaluator::new(&genome).expect("acyclic genome");
+
+// 2D pattern: width x height pixels in [-1, 1]^2, output normalized to [0, 1].
+let pattern: Vec<f32> = evaluator.generate_pattern_2d(64, 64, 0).unwrap();
+
+// 3D voxel grid: (w, h, d) with x-fastest, then y, then z (z slowest).
+let voxels: Vec<f32> = evaluator.generate_voxel_grid([32, 32, 32], 0).unwrap();
+```
+
+Both methods return `Err(PatternError::InputArityMismatch)` if the CPPN's
+input arity does not match the pattern's dimensionality (2 inputs for 2D,
+3 for 3D), and `Err(PatternError::OutputIndexOutOfBounds)` if the output
+index is too large.
+
+### `image` feature
+
+PNG export via the [`image`](https://crates.io/crates/image) crate is gated
+behind the `image` Cargo feature so that consumers who don't need it pay
+no compile-time cost:
+
+```toml
+[dependencies]
+symbios-neat = { version = "...", features = ["image"] }
+```
+
+With the feature on:
+
+```rust,ignore
+# #[cfg(feature = "image")]
+let img: image::RgbaImage = evaluator.generate_image(256, 256, 0).unwrap();
+img.save("cppn_pattern.png").unwrap();
+```
+
+## HyperNEAT Substrates
+
+For indirect encoding, evolve a CPPN that emits weights for a fixed
+substrate of nodes. See `examples/hyperneat_xor.rs` for a complete run.
+
+```rust,ignore
+use symbios_neat::{
+    substrate::{substrate_to_network, LayeredSubstrate},
+    Activation, CppnEvaluator,
+};
+
+let substrate = LayeredSubstrate::new(&[2, 2, 1], Activation::Tanh, Activation::Sigmoid);
+let cppn = CppnEvaluator::new(&cppn_genome).unwrap();
+let network = substrate_to_network(&cppn, &substrate, 0.2);
+let outputs = network.evaluate(&[0.5, -0.3]);
+```
+
 ## Architecture
 
 ### Hash-Based Innovation (Sovereign Innovation)
@@ -102,18 +162,18 @@ Nodes and connections are stored in flat `SlotMap` buffers:
 
 ### Activation Functions
 
-| Function | Formula | Use Case |
-|----------|---------|----------|
-| Sigmoid | `1 / (1 + e^(-x))` | Classification, bounded output |
-| Tanh | `tanh(x)` | Centered output [-1, 1] |
-| ReLU | `max(0, x)` | Hidden layers |
-| Sine | `sin(x)` | Periodic/wave patterns (CPPN) |
-| Cosine | `cos(x)` | Periodic/wave patterns (CPPN) |
-| Gaussian | `e^(-x^2)` | Radial patterns (CPPN) |
-| Abs | `\|x\|` | Symmetric patterns (CPPN) |
-| Step | `x >= 0 ? 1 : 0` | Binary decisions |
-| LeakyReLU | `x > 0 ? x : 0.01x` | Hidden layers |
-| Identity | `x` | Pass-through |
+| Function  | Formula             | Use Case                       |
+|---------- |---------------------|--------------------------------|
+| Sigmoid   | `1 / (1 + e^(-x))`  | Classification, bounded output |
+| Tanh      | `tanh(x)`           | Centered output [-1, 1]        |
+| ReLU      | `max(0, x)`         | Hidden layers                  |
+| Sine      | `sin(x)`            | Periodic/wave patterns (CPPN)  |
+| Cosine    | `cos(x)`            | Periodic/wave patterns (CPPN)  |
+| Gaussian  | `e^(-x^2)`          | Radial patterns (CPPN)         |
+| Abs       | `\|x\|`             | Symmetric patterns (CPPN)      |
+| Step      | `x >= 0 ? 1 : 0`    | Binary decisions               |
+| LeakyReLU | `x > 0 ? x : 0.01x` | Hidden layers                  |
+| Identity  | `x`                 | Pass-through                   |
 
 ## Configuration
 

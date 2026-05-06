@@ -4,8 +4,8 @@ use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use symbios_genetics::Genotype;
 use symbios_neat::{
-    connection_innovation, generate_pattern, node_split_innovation, Activation, CppnEvaluator,
-    NeatConfig, NeatGenome, NodeType,
+    connection_innovation, node_split_innovation, Activation, CppnEvaluator, NeatConfig,
+    NeatGenome, NodeType,
 };
 
 // =============================================================================
@@ -42,7 +42,7 @@ fn test_evaluator_preserves_input_output_order_after_crossover() {
     assert_eq!(child.output_ids.len(), 2, "Child should have 2 outputs");
 
     // Create evaluator and verify it respects semantic ordering
-    let evaluator = CppnEvaluator::new(&child);
+    let evaluator = CppnEvaluator::new(&child).unwrap();
 
     // Evaluate with distinct inputs [1.0, 0.0] and [0.0, 1.0]
     // If input mapping is correct, these should produce different outputs
@@ -76,7 +76,7 @@ fn test_evaluator_preserves_order_after_serialization() {
     }
 
     // Evaluate original
-    let eval1 = CppnEvaluator::new(&genome);
+    let eval1 = CppnEvaluator::new(&genome).unwrap();
     let inputs = [0.5, -0.3, 0.8];
     let output_before = eval1.evaluate(&inputs);
 
@@ -89,7 +89,7 @@ fn test_evaluator_preserves_order_after_serialization() {
     assert_eq!(genome.output_ids.len(), restored.output_ids.len());
 
     // Evaluate restored - should produce identical results
-    let eval2 = CppnEvaluator::new(&restored);
+    let eval2 = CppnEvaluator::new(&restored).unwrap();
     let output_after = eval2.evaluate(&inputs);
 
     for (i, (&before, &after)) in output_before.iter().zip(output_after.iter()).enumerate() {
@@ -205,14 +205,14 @@ fn test_generate_pattern_returns_result_not_panic() {
     let config = NeatConfig::cppn(2, 1);
     let mut rng = ChaCha8Rng::seed_from_u64(42);
     let genome = NeatGenome::fully_connected(config, &mut rng);
-    let mut evaluator = CppnEvaluator::new(&genome);
+    let evaluator = CppnEvaluator::new(&genome).unwrap();
 
     // Valid index should return Ok
-    let result = generate_pattern(&mut evaluator, 4, 4, 0);
+    let result = evaluator.generate_pattern_2d(4, 4, 0);
     assert!(result.is_ok(), "Valid output_index should return Ok");
 
     // Invalid index should return Err, not panic
-    let result = generate_pattern(&mut evaluator, 4, 4, 99);
+    let result = evaluator.generate_pattern_2d(4, 4, 99);
     assert!(result.is_err(), "Invalid output_index should return Err");
 
     // Error should be descriptive
@@ -321,9 +321,7 @@ fn test_network_no_overflow_with_large_weights() {
     for _ in 0..5 {
         if let Some(conn_id) = genome
             .connections
-            .iter()
-            .filter(|(_, c)| c.enabled)
-            .next()
+            .iter().find(|(_, c)| c.enabled)
             .map(|(id, _)| id)
         {
             genome.add_node(conn_id, &mut rng);
@@ -337,7 +335,7 @@ fn test_network_no_overflow_with_large_weights() {
         }
     }
 
-    let evaluator = CppnEvaluator::new(&genome);
+    let evaluator = CppnEvaluator::new(&genome).unwrap();
     let output = evaluator.evaluate(&[100.0, 100.0]);
 
     // Output should be finite, not overflow to infinity
@@ -359,9 +357,7 @@ fn test_update_depths_terminates() {
     for _ in 0..20 {
         if let Some(conn_id) = genome
             .connections
-            .iter()
-            .filter(|(_, c)| c.enabled)
-            .next()
+            .iter().find(|(_, c)| c.enabled)
             .map(|(id, _)| id)
         {
             genome.add_node(conn_id, &mut rng);
@@ -567,7 +563,7 @@ fn test_crossover_acyclic() {
         );
 
         // Verify the child can be evaluated without hanging
-        let evaluator = CppnEvaluator::new(&child);
+        let evaluator = CppnEvaluator::new(&child).unwrap();
         let output = evaluator.evaluate(&[0.5, 0.5]);
         assert!(output[0].is_finite(), "Child should produce finite output");
     }
@@ -604,7 +600,7 @@ fn test_evaluate_into_matches_evaluate() {
         genome.mutate(&mut rng, 1.0);
     }
 
-    let evaluator = CppnEvaluator::new(&genome);
+    let evaluator = CppnEvaluator::new(&genome).unwrap();
 
     let inputs = [0.5, -0.3, 0.8];
     let outputs_vec = evaluator.evaluate(&inputs);
@@ -664,7 +660,7 @@ fn test_large_scale_evolution_stability() {
                 i
             );
 
-            let evaluator = CppnEvaluator::new(genome);
+            let evaluator = CppnEvaluator::new(genome).unwrap();
             let output = evaluator.evaluate(&[0.1, 0.2, 0.3, 0.4]);
             for (j, &val) in output.iter().enumerate() {
                 assert!(
@@ -718,7 +714,7 @@ fn test_full_evolution_cycle() {
 
     // Verify population is still valid
     for genome in &population {
-        let evaluator = CppnEvaluator::new(genome);
+        let evaluator = CppnEvaluator::new(genome).unwrap();
         let output = evaluator.evaluate(&[0.5, 0.5]);
         assert_eq!(output.len(), 1);
         assert!(output[0].is_finite());
@@ -762,7 +758,7 @@ fn test_extreme_weight_range_handled() {
 
     // Weights might be infinite due to overflow, but the code shouldn't panic
     // and the evaluator should still work (activation functions clamp infinity)
-    let evaluator = CppnEvaluator::new(&genome);
+    let evaluator = CppnEvaluator::new(&genome).unwrap();
     let output = evaluator.evaluate(&[0.5, 0.5]);
 
     // Output should be finite because activation functions clamp extreme values
@@ -1019,11 +1015,11 @@ fn test_generate_pattern_single_pixel() {
         conn.enabled = false;
     }
 
-    let mut evaluator = CppnEvaluator::new(&genome);
+    let evaluator = CppnEvaluator::new(&genome).unwrap();
 
     // For 1x1 pattern, the single pixel should be at (0, 0)
     // Output = tanh(0 + 0) = 0, normalized from [-1,1] to [0,1] = 0.5
-    let pattern_1x1 = generate_pattern(&mut evaluator, 1, 1, 0).unwrap();
+    let pattern_1x1 = evaluator.generate_pattern_2d(1, 1, 0).unwrap();
     assert_eq!(pattern_1x1.len(), 1);
     assert!(
         (pattern_1x1[0] - 0.5).abs() < 0.01,
@@ -1034,7 +1030,7 @@ fn test_generate_pattern_single_pixel() {
     // For 2x1 pattern, pixels should be at x=-1 and x=+1, y=0
     // Output[0] = tanh(-1 + 0) ≈ -0.76, normalized to ~0.12
     // Output[1] = tanh(+1 + 0) ≈ +0.76, normalized to ~0.88
-    let pattern_2x1 = generate_pattern(&mut evaluator, 2, 1, 0).unwrap();
+    let pattern_2x1 = evaluator.generate_pattern_2d(2, 1, 0).unwrap();
     assert_eq!(pattern_2x1.len(), 2);
     // Verify pattern[0] < pattern[1] (x=-1 gives lower value than x=+1)
     assert!(
@@ -1060,10 +1056,10 @@ fn test_generate_pattern_invalid_output_index_returns_error() {
     let mut rng = ChaCha8Rng::seed_from_u64(42);
     let genome = NeatGenome::fully_connected(config, &mut rng);
 
-    let mut evaluator = CppnEvaluator::new(&genome);
+    let evaluator = CppnEvaluator::new(&genome).unwrap();
 
     // Request output index 5 when only 1 output exists - should return error
-    let result = generate_pattern(&mut evaluator, 4, 4, 5);
+    let result = evaluator.generate_pattern_2d(4, 4, 5);
     assert!(
         result.is_err(),
         "Should return error for out-of-bounds output_index"
@@ -1089,17 +1085,15 @@ fn test_cppn_produces_spatial_patterns() {
     for _ in 0..3 {
         if let Some(conn_id) = genome
             .connections
-            .iter()
-            .filter(|(_, c)| c.enabled)
-            .next()
+            .iter().find(|(_, c)| c.enabled)
             .map(|(id, _)| id)
         {
             genome.add_node(conn_id, &mut rng);
         }
     }
 
-    let mut evaluator = CppnEvaluator::new(&genome);
-    let pattern = generate_pattern(&mut evaluator, 8, 8, 0).unwrap();
+    let evaluator = CppnEvaluator::new(&genome).unwrap();
+    let pattern = evaluator.generate_pattern_2d(8, 8, 0).unwrap();
 
     // Pattern should have some variation (not all same value)
     let min = pattern.iter().cloned().fold(f32::INFINITY, f32::min);
@@ -1233,7 +1227,7 @@ fn test_evaluator_handles_stale_depths() {
     }
 
     // The evaluator should still work correctly because it recomputes depths
-    let evaluator = CppnEvaluator::new(&genome);
+    let evaluator = CppnEvaluator::new(&genome).unwrap();
     let output = evaluator.evaluate(&[1.0, 2.0]);
 
     // With correct depth computation: output = input0 + input1 = 3.0
@@ -1264,7 +1258,7 @@ fn test_evaluation_order_respects_dependencies() {
 
     // Initial network: input0 + input1 -> output
     // With identity activation and weights 1.0: output = input0 + input1
-    let evaluator = CppnEvaluator::new(&genome);
+    let evaluator = CppnEvaluator::new(&genome).unwrap();
     let output = evaluator.evaluate(&[1.0, 2.0]);
     assert!(
         (output[0] - 3.0).abs() < 1e-5,
@@ -1287,7 +1281,7 @@ fn test_evaluation_order_respects_dependencies() {
         }
     }
 
-    let evaluator = CppnEvaluator::new(&genome);
+    let evaluator = CppnEvaluator::new(&genome).unwrap();
     let output = evaluator.evaluate(&[1.0, 2.0]);
 
     // If depth is wrong, hidden might not be evaluated before output
@@ -1311,7 +1305,7 @@ fn test_serialization_preserves_behavior() {
     }
 
     // Evaluate original
-    let eval1 = CppnEvaluator::new(&genome);
+    let eval1 = CppnEvaluator::new(&genome).unwrap();
     let output1 = eval1.query_2d(0.5, -0.3);
 
     // Serialize and deserialize
@@ -1319,7 +1313,7 @@ fn test_serialization_preserves_behavior() {
     let restored: NeatGenome = serde_json::from_str(&json).unwrap();
 
     // Evaluate restored
-    let eval2 = CppnEvaluator::new(&restored);
+    let eval2 = CppnEvaluator::new(&restored).unwrap();
     let output2 = eval2.query_2d(0.5, -0.3);
 
     // Outputs should match
@@ -1363,7 +1357,7 @@ fn test_all_activation_functions_work() {
         let mut rng = ChaCha8Rng::seed_from_u64(42);
         let genome = NeatGenome::fully_connected(config, &mut rng);
 
-        let evaluator = CppnEvaluator::new(&genome);
+        let evaluator = CppnEvaluator::new(&genome).unwrap();
         let output = evaluator.evaluate(&[0.5]);
 
         assert!(
@@ -1392,9 +1386,7 @@ fn test_deep_network_no_stack_overflow_has_cycle() {
         // Find an enabled connection to split
         if let Some(conn_id) = genome
             .connections
-            .iter()
-            .filter(|(_, c)| c.enabled)
-            .next()
+            .iter().find(|(_, c)| c.enabled)
             .map(|(id, _)| id)
         {
             genome.add_node(conn_id, &mut rng);
@@ -1425,9 +1417,7 @@ fn test_deep_network_no_stack_overflow_break_cycles() {
     for _ in 0..500 {
         if let Some(conn_id) = genome
             .connections
-            .iter()
-            .filter(|(_, c)| c.enabled)
-            .next()
+            .iter().find(|(_, c)| c.enabled)
             .map(|(id, _)| id)
         {
             genome.add_node(conn_id, &mut rng);
@@ -1556,10 +1546,10 @@ fn test_add_connection_weight_clamped() {
     );
 }
 
-/// Test that CppnEvaluator::try_new returns error for cyclic genomes.
+/// Test that CppnEvaluator::new returns error for cyclic genomes.
 /// This verifies the fix for issue #42 (evaluator ignoring cycle detection).
 #[test]
-fn test_evaluator_try_new_detects_cycles() {
+fn test_evaluator_new_detects_cycles() {
     use symbios_neat::EvaluatorError;
 
     let config = NeatConfig::minimal(2, 1);
@@ -1567,7 +1557,7 @@ fn test_evaluator_try_new_detects_cycles() {
     let genome = NeatGenome::fully_connected(config, &mut rng);
 
     // A normal acyclic genome should succeed
-    let result = CppnEvaluator::try_new(&genome);
+    let result = CppnEvaluator::new(&genome);
     assert!(result.is_ok(), "Acyclic genome should create evaluator");
 
     // Verify the error type exists and displays properly
@@ -1600,7 +1590,7 @@ fn test_deep_network_evaluation_after_fixes() {
     assert!(!genome.has_cycle(), "Mutated genome should be acyclic");
 
     // Create evaluator (should not panic even with deep network)
-    let result = CppnEvaluator::try_new(&genome);
+    let result = CppnEvaluator::new(&genome);
     assert!(
         result.is_ok(),
         "Deep acyclic genome should create evaluator"
@@ -1636,7 +1626,7 @@ fn test_crossover_deep_parents() {
     // Child should be valid
     assert!(!child.has_cycle(), "Child should be acyclic");
 
-    let result = CppnEvaluator::try_new(&child);
+    let result = CppnEvaluator::new(&child);
     assert!(result.is_ok(), "Child should create valid evaluator");
 }
 
@@ -1664,7 +1654,7 @@ fn test_precision_preserved_with_reduced_clamp_bound() {
         conn.weight = 100.0;
     }
 
-    let evaluator = CppnEvaluator::new(&genome);
+    let evaluator = CppnEvaluator::new(&genome).unwrap();
 
     // Test with small input values (0.001)
     // With old 1e6 clamp: sum could reach 1e12, losing precision for small signals
@@ -1707,8 +1697,8 @@ fn test_generate_pattern_relu_normalization() {
         conn.weight = 0.5;
     }
 
-    let mut evaluator = CppnEvaluator::new(&genome);
-    let pattern = generate_pattern(&mut evaluator, 4, 4, 0).unwrap();
+    let evaluator = CppnEvaluator::new(&genome).unwrap();
+    let pattern = evaluator.generate_pattern_2d(4, 4, 0).unwrap();
 
     // With correct normalization:
     // ReLU output 0.0 should normalize to 0.0 (not 0.5 as with old code)
@@ -1745,8 +1735,8 @@ fn test_generate_pattern_abs_normalization() {
     let mut rng = ChaCha8Rng::seed_from_u64(42);
     let genome = NeatGenome::fully_connected(config, &mut rng);
 
-    let mut evaluator = CppnEvaluator::new(&genome);
-    let pattern = generate_pattern(&mut evaluator, 4, 4, 0).unwrap();
+    let evaluator = CppnEvaluator::new(&genome).unwrap();
+    let pattern = evaluator.generate_pattern_2d(4, 4, 0).unwrap();
 
     // All values should be in [0, 1]
     for &val in &pattern {
@@ -1920,7 +1910,7 @@ fn test_innovation_hash_above_reserved_range() {
     }
 }
 
-/// Test that CppnEvaluator::try_new doesn't clone the genome.
+/// Test that CppnEvaluator::new doesn't clone the genome.
 /// We verify this indirectly by checking the genome is not modified.
 /// This verifies the fix for issue #46 (redundant clone).
 #[test]
@@ -1933,7 +1923,7 @@ fn test_evaluator_construction_no_genome_mutation() {
     let depths_before: Vec<u32> = genome.nodes.iter().map(|(_, n)| n.depth).collect();
 
     // Create evaluator
-    let _evaluator = CppnEvaluator::new(&genome);
+    let _evaluator = CppnEvaluator::new(&genome).unwrap();
 
     // Depths should be unchanged (evaluator computes locally)
     let depths_after: Vec<u32> = genome.nodes.iter().map(|(_, n)| n.depth).collect();
@@ -1989,8 +1979,8 @@ fn test_generate_pattern_tanh_still_works() {
     let mut rng = ChaCha8Rng::seed_from_u64(42);
     let genome = NeatGenome::fully_connected(config, &mut rng);
 
-    let mut evaluator = CppnEvaluator::new(&genome);
-    let pattern = generate_pattern(&mut evaluator, 8, 8, 0).unwrap();
+    let evaluator = CppnEvaluator::new(&genome).unwrap();
+    let pattern = evaluator.generate_pattern_2d(8, 8, 0).unwrap();
 
     // Pattern should span a reasonable range (not all 0.5 or all 0/1)
     let min = pattern.iter().cloned().fold(f32::INFINITY, f32::min);
@@ -2144,7 +2134,7 @@ fn test_evaluator_csr_format_correctness() {
         genome.mutate(&mut rng, 1.0);
     }
 
-    let evaluator = CppnEvaluator::new(&genome);
+    let evaluator = CppnEvaluator::new(&genome).unwrap();
 
     // Evaluate with various inputs
     let test_inputs = [

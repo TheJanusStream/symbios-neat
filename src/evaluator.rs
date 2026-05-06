@@ -7,6 +7,7 @@
 
 use crate::gene::{NodeId, NodeType};
 use crate::genome::NeatGenome;
+use crate::network::{FeedforwardNetwork, Scratchpad};
 use crate::topology::GraphTopology;
 
 /// Reusable scratchpad for CPPN evaluation.
@@ -26,7 +27,7 @@ use crate::topology::GraphTopology;
 /// use std::sync::Arc;
 /// use rayon::prelude::*;
 ///
-/// let evaluator = Arc::new(CppnEvaluator::new(&genome));
+/// let evaluator = Arc::new(CppnEvaluator::new(&genome).unwrap());
 ///
 /// let results: Vec<f32> = coordinates
 ///     .par_iter()
@@ -40,34 +41,12 @@ use crate::topology::GraphTopology;
 ///     )
 ///     .collect();
 /// ```
-#[derive(Debug, Clone)]
-pub struct EvalScratchpad {
-    /// Node activations in topological order.
-    activations: Vec<f32>,
-}
-
-impl EvalScratchpad {
-    /// Create a new scratchpad with the given capacity.
-    fn new(num_nodes: usize) -> Self {
-        Self {
-            activations: vec![0.0; num_nodes],
-        }
-    }
-
-    /// Reset all activations to zero.
-    #[inline]
-    fn reset(&mut self) {
-        for act in &mut self.activations {
-            *act = 0.0;
-        }
-    }
-}
+pub type EvalScratchpad = Scratchpad;
 
 /// A compiled, evaluation-ready representation of a NEAT genome.
 ///
-/// The evaluator pre-computes topological order and organizes data for
-/// cache-efficient forward propagation. Uses Compressed Sparse Row (CSR) format
-/// for O(N+E) evaluation with optimal cache locality.
+/// Wraps a [`FeedforwardNetwork`] with CPPN-specific query helpers
+/// ([`query_2d`](Self::query_2d), [`query_3d`](Self::query_3d), etc.).
 ///
 /// # Thread Safety
 ///
@@ -76,28 +55,7 @@ impl EvalScratchpad {
 /// shared across threads via `Arc<CppnEvaluator>`.
 #[derive(Debug, Clone)]
 pub struct CppnEvaluator {
-    /// Number of nodes (for scratchpad creation).
-    num_nodes: usize,
-    /// Node biases.
-    biases: Vec<f32>,
-    /// Activation function indices.
-    activation_fns: Vec<crate::activation::Activation>,
-    // CSR format for incoming connections - contiguous memory for cache locality.
-    // For node i, incoming connections are at indices [csr_offsets[i]..csr_offsets[i+1]).
-    /// CSR: source node indices for all connections (flat array).
-    csr_sources: Vec<usize>,
-    /// CSR: weights for all connections (flat array, parallel to csr_sources).
-    csr_weights: Vec<f32>,
-    /// CSR: offsets into csr_sources/csr_weights for each node (len = num_nodes + 1).
-    csr_offsets: Vec<usize>,
-    /// Indices of input nodes in the activations array.
-    input_indices: Vec<usize>,
-    /// Indices of output nodes in the activations array.
-    output_indices: Vec<usize>,
-    /// Index of bias node if present.
-    bias_index: Option<usize>,
-    /// Evaluation order (indices into activations, excluding inputs).
-    eval_order: Vec<usize>,
+    network: FeedforwardNetwork,
 }
 
 /// Error type for evaluator construction failures.
@@ -128,23 +86,9 @@ impl std::error::Error for EvaluatorError {}
 impl CppnEvaluator {
     /// Compile a NEAT genome into an efficient evaluator.
     ///
-    /// This method ensures depth consistency by recomputing depths before
-    /// building the evaluator. This guarantees correct evaluation order even
-    /// if the genome was modified without calling `update_depths()`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the genome contains cycles. Use [`try_new`](Self::try_new) for
-    /// non-panicking construction, or [`NeatGenome::break_cycles`] to fix the genome first.
-    #[must_use]
-    pub fn new(genome: &NeatGenome) -> Self {
-        Self::try_new(genome).expect("genome contains cycles; use try_new() or break_cycles()")
-    }
-
-    /// Try to compile a NEAT genome into an efficient evaluator.
-    ///
     /// Returns an error if the genome contains cycles, which would make feedforward
-    /// evaluation mathematically undefined.
+    /// evaluation mathematically undefined. Callers with cyclic genomes should
+    /// use [`NeatGenome::break_cycles`] before constructing the evaluator.
     ///
     /// Uses shared GraphTopology for O(V+E) depth computation with CSR format,
     /// avoiding duplicated Vec<Vec<usize>> allocations. Edges are sorted by
@@ -153,7 +97,7 @@ impl CppnEvaluator {
     /// # Errors
     ///
     /// Returns [`EvaluatorError::CyclicGenome`] if the genome contains cycles.
-    pub fn try_new(genome: &NeatGenome) -> Result<Self, EvaluatorError> {
+    pub fn new(genome: &NeatGenome) -> Result<Self, EvaluatorError> {
         // Use shared GraphTopology for depth computation - avoids code duplication
         // and ensures deterministic edge ordering by innovation number.
         let topo = GraphTopology::from_genome(genome);
@@ -220,121 +164,56 @@ impl CppnEvaluator {
             topo.get_csr_for_evaluation(genome, &node_id_to_idx);
 
         Ok(Self {
-            num_nodes: node_count,
-            biases,
-            activation_fns,
-            csr_sources,
-            csr_weights,
-            csr_offsets,
-            input_indices,
-            output_indices,
-            bias_index,
-            eval_order,
+            network: FeedforwardNetwork {
+                num_nodes: node_count,
+                biases,
+                activations: activation_fns,
+                csr_sources,
+                csr_weights,
+                csr_offsets,
+                input_indices,
+                output_indices,
+                bias_index,
+                eval_order,
+            },
         })
     }
 
-    /// Create a new scratchpad for evaluation.
+    /// Borrow the underlying [`FeedforwardNetwork`].
     ///
-    /// Each thread performing parallel evaluation should have its own scratchpad.
-    /// The scratchpad can be reused across multiple evaluations.
+    /// Useful for passing the evaluation core to code that doesn't need
+    /// CPPN-specific helpers (e.g., HyperNEAT substrate consumers).
     #[must_use]
-    pub fn create_scratchpad(&self) -> EvalScratchpad {
-        EvalScratchpad::new(self.num_nodes)
+    pub fn network(&self) -> &FeedforwardNetwork {
+        &self.network
     }
 
-    /// Evaluate the network with given inputs, writing results to a provided buffer.
-    ///
-    /// This is the allocation-free, thread-safe version for hot paths like CPPN
-    /// pattern generation. Uses f64 internally for summation to reduce floating-point
-    /// accumulation errors.
-    ///
-    /// # Arguments
-    ///
-    /// * `inputs` - Input values. Must match the number of input nodes.
-    /// * `outputs` - Buffer to write output values. Must match the number of output nodes.
-    /// * `scratch` - Mutable scratchpad for intermediate activations.
+    /// Allocate a fresh scratchpad sized for this evaluator's network.
+    #[must_use]
+    pub fn create_scratchpad(&self) -> EvalScratchpad {
+        self.network.create_scratchpad()
+    }
+
+    /// Evaluate the network with given inputs into a caller-supplied buffer.
     ///
     /// # Panics
     ///
     /// Panics if input or output length doesn't match the network configuration.
     pub fn evaluate_into(&self, inputs: &[f32], outputs: &mut [f32], scratch: &mut EvalScratchpad) {
-        assert_eq!(
-            inputs.len(),
-            self.input_indices.len(),
-            "Input length mismatch: expected {}, got {}",
-            self.input_indices.len(),
-            inputs.len()
-        );
-        assert_eq!(
-            outputs.len(),
-            self.output_indices.len(),
-            "Output length mismatch: expected {}, got {}",
-            self.output_indices.len(),
-            outputs.len()
-        );
-
-        // Reset activations
-        scratch.reset();
-
-        // Set input values
-        for (i, &idx) in self.input_indices.iter().enumerate() {
-            scratch.activations[idx] = inputs[i];
-        }
-
-        // Set bias value
-        if let Some(bias_idx) = self.bias_index {
-            scratch.activations[bias_idx] = 1.0;
-        }
-
-        // Forward propagation in topological order - O(N+E) using CSR format.
-        // CSR enables contiguous memory access for optimal cache performance.
-        // Uses f64 for summation to reduce floating-point accumulation errors.
-        for &node_idx in &self.eval_order {
-            // Sum incoming connections from CSR arrays using f64 precision
-            let mut sum: f64 = f64::from(self.biases[node_idx]);
-            let start = self.csr_offsets[node_idx];
-            let end = self.csr_offsets[node_idx + 1];
-            for i in start..end {
-                let from_idx = self.csr_sources[i];
-                let weight = f64::from(self.csr_weights[i]);
-                let activation = f64::from(scratch.activations[from_idx]);
-                sum += activation * weight;
-            }
-
-            // Apply activation function (converts back to f32)
-            #[allow(clippy::cast_possible_truncation)]
-            let sum_f32 = sum as f32;
-            scratch.activations[node_idx] = self.activation_fns[node_idx].apply(sum_f32);
-        }
-
-        // Write outputs to buffer
-        for (i, &idx) in self.output_indices.iter().enumerate() {
-            outputs[i] = scratch.activations[idx];
-        }
+        self.network.evaluate_into(inputs, outputs, scratch);
     }
 
     /// Evaluate the network with given inputs.
     ///
-    /// This convenience method creates a temporary scratchpad for single evaluations.
-    /// For repeated evaluations (e.g., pattern generation), use [`evaluate_into`](Self::evaluate_into)
-    /// with a reusable scratchpad for better performance.
-    ///
-    /// # Arguments
-    ///
-    /// * `inputs` - Input values. Must match the number of input nodes.
-    ///
-    /// # Returns
-    ///
-    /// Output values from the network.
+    /// For repeated evaluation prefer
+    /// [`evaluate_into`](Self::evaluate_into) with a reusable scratchpad.
     ///
     /// # Panics
     ///
     /// Panics if input length doesn't match the number of input nodes.
+    #[must_use]
     pub fn evaluate(&self, inputs: &[f32]) -> Vec<f32> {
-        let mut scratch = self.create_scratchpad();
-        let mut outputs = vec![0.0; self.output_indices.len()];
-        self.evaluate_into(inputs, &mut outputs, &mut scratch);
-        outputs
+        self.network.evaluate(inputs)
     }
 
     /// Query the CPPN with 2D coordinates.
@@ -375,14 +254,14 @@ impl CppnEvaluator {
 
     /// Get the number of input nodes.
     #[must_use]
-    pub const fn num_inputs(&self) -> usize {
-        self.input_indices.len()
+    pub fn num_inputs(&self) -> usize {
+        self.network.num_inputs()
     }
 
     /// Get the number of output nodes.
     #[must_use]
-    pub const fn num_outputs(&self) -> usize {
-        self.output_indices.len()
+    pub fn num_outputs(&self) -> usize {
+        self.network.num_outputs()
     }
 
     /// Get the activation function for a specific output node.
@@ -392,7 +271,7 @@ impl CppnEvaluator {
     /// Panics if `output_index` is out of bounds.
     #[must_use]
     pub fn output_activation(&self, output_index: usize) -> crate::activation::Activation {
-        self.activation_fns[self.output_indices[output_index]]
+        self.network.output_activation(output_index)
     }
 }
 
@@ -405,6 +284,14 @@ pub enum PatternError {
         requested: usize,
         /// The actual number of outputs.
         available: usize,
+    },
+    /// The CPPN's input arity does not match the pattern dimensionality
+    /// (e.g. calling `generate_pattern_2d` on a CPPN that does not accept 2 inputs).
+    InputArityMismatch {
+        /// The number of inputs expected for this pattern dimensionality.
+        expected: usize,
+        /// The number of inputs the CPPN actually has.
+        actual: usize,
     },
 }
 
@@ -419,92 +306,171 @@ impl std::fmt::Display for PatternError {
                 "output_index {} out of bounds for network with {} outputs",
                 requested, available
             ),
+            PatternError::InputArityMismatch { expected, actual } => write!(
+                f,
+                "CPPN must accept {} inputs for this pattern, got {}",
+                expected, actual
+            ),
         }
     }
 }
 
 impl std::error::Error for PatternError {}
 
-/// Generate a 2D pattern image from a CPPN.
-///
-/// # Arguments
-///
-/// * `evaluator` - The CPPN evaluator (must have 2+ inputs and 1+ outputs)
-/// * `width` - Image width in pixels
-/// * `height` - Image height in pixels
-/// * `output_index` - Which output to use (0 for first output)
-///
-/// # Returns
-///
-/// A flattened grayscale image as `f32` values in `[0, 1]`, or an error if
-/// the output index is out of bounds.
-///
-/// # Errors
-///
-/// Returns [`PatternError::OutputIndexOutOfBounds`] if `output_index` >= number of outputs.
-#[allow(clippy::cast_precision_loss)] // Image dimensions are small enough
-pub fn generate_pattern(
-    evaluator: &CppnEvaluator,
-    width: usize,
-    height: usize,
-    output_index: usize,
-) -> Result<Vec<f32>, PatternError> {
-    // Validate output_index upfront to fail fast
-    if output_index >= evaluator.num_outputs() {
+impl CppnEvaluator {
+    /// Generate a 2D grayscale pattern by querying the CPPN over a grid of
+    /// `width × height` pixels in `[-1, 1]²`.
+    ///
+    /// Returns a flat row-major buffer of `f32` values in `[0, 1]` (length
+    /// `width * height`, x-major within each row, y outermost).
+    ///
+    /// Output is normalized using the activation function's range, so the
+    /// result is meaningful for any activation (Tanh, Sigmoid, ReLU, etc.).
+    ///
+    /// # Errors
+    ///
+    /// - [`PatternError::InputArityMismatch`] if the CPPN does not accept 2 inputs.
+    /// - [`PatternError::OutputIndexOutOfBounds`] if `output_index` is too large.
+    #[allow(clippy::cast_precision_loss)]
+    pub fn generate_pattern_2d(
+        &self,
+        width: u32,
+        height: u32,
+        output_index: usize,
+    ) -> Result<Vec<f32>, PatternError> {
+        validate_inputs(self, 2)?;
+        validate_output_index(self, output_index)?;
+
+        let w = width as usize;
+        let h = height as usize;
+        let mut pattern = Vec::with_capacity(w * h);
+        let mut scratch = self.create_scratchpad();
+        let mut inputs = [0.0f32; 2];
+        let mut outputs = vec![0.0f32; self.num_outputs()];
+
+        let (min_val, max_val) = self.output_activation(output_index).output_range();
+        let range = max_val - min_val;
+
+        for y in 0..h {
+            for x in 0..w {
+                inputs[0] = grid_coord(x, w);
+                inputs[1] = grid_coord(y, h);
+                self.evaluate_into(&inputs, &mut outputs, &mut scratch);
+                pattern.push(normalize(outputs[output_index], min_val, range));
+            }
+        }
+        Ok(pattern)
+    }
+
+    /// Generate a 3D voxel grid by querying the CPPN over `dims = [w, h, d]`
+    /// points in `[-1, 1]³`.
+    ///
+    /// Returns a flat row-major buffer of length `w * h * d`, with axis order
+    /// **x fastest, then y, then z slowest** — i.e. index `[x, y, z]` lives at
+    /// offset `z * (h * w) + y * w + x`.
+    ///
+    /// # Errors
+    ///
+    /// - [`PatternError::InputArityMismatch`] if the CPPN does not accept 3 inputs.
+    /// - [`PatternError::OutputIndexOutOfBounds`] if `output_index` is too large.
+    #[allow(clippy::cast_precision_loss)]
+    pub fn generate_voxel_grid(
+        &self,
+        dims: [u32; 3],
+        output_index: usize,
+    ) -> Result<Vec<f32>, PatternError> {
+        validate_inputs(self, 3)?;
+        validate_output_index(self, output_index)?;
+
+        let w = dims[0] as usize;
+        let h = dims[1] as usize;
+        let d = dims[2] as usize;
+        let mut grid = Vec::with_capacity(w * h * d);
+        let mut scratch = self.create_scratchpad();
+        let mut inputs = [0.0f32; 3];
+        let mut outputs = vec![0.0f32; self.num_outputs()];
+
+        let (min_val, max_val) = self.output_activation(output_index).output_range();
+        let range = max_val - min_val;
+
+        for z in 0..d {
+            for y in 0..h {
+                for x in 0..w {
+                    inputs[0] = grid_coord(x, w);
+                    inputs[1] = grid_coord(y, h);
+                    inputs[2] = grid_coord(z, d);
+                    self.evaluate_into(&inputs, &mut outputs, &mut scratch);
+                    grid.push(normalize(outputs[output_index], min_val, range));
+                }
+            }
+        }
+        Ok(grid)
+    }
+
+    /// Generate a 2D RGBA image (grayscale → RGBA) from the CPPN.
+    ///
+    /// Available behind the `image` Cargo feature. Each pixel's grayscale
+    /// value `g ∈ [0, 1]` is encoded as `(g, g, g, 1)` after scaling to `u8`.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`generate_pattern_2d`](Self::generate_pattern_2d).
+    #[cfg(feature = "image")]
+    pub fn generate_image(
+        &self,
+        width: u32,
+        height: u32,
+        output_index: usize,
+    ) -> Result<image::RgbaImage, PatternError> {
+        let pattern = self.generate_pattern_2d(width, height, output_index)?;
+        let mut img = image::RgbaImage::new(width, height);
+        for (i, pixel) in img.pixels_mut().enumerate() {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let v = (pattern[i].clamp(0.0, 1.0) * 255.0) as u8;
+            *pixel = image::Rgba([v, v, v, 255]);
+        }
+        Ok(img)
+    }
+}
+
+#[allow(clippy::cast_precision_loss)]
+#[inline]
+fn grid_coord(idx: usize, len: usize) -> f32 {
+    if len <= 1 {
+        0.0
+    } else {
+        let t = idx as f32 / (len - 1) as f32;
+        t.mul_add(2.0, -1.0)
+    }
+}
+
+#[inline]
+fn normalize(value: f32, min_val: f32, range: f32) -> f32 {
+    if range > 0.0 {
+        ((value - min_val) / range).clamp(0.0, 1.0)
+    } else {
+        0.5
+    }
+}
+
+fn validate_output_index(eval: &CppnEvaluator, output_index: usize) -> Result<(), PatternError> {
+    if output_index >= eval.num_outputs() {
         return Err(PatternError::OutputIndexOutOfBounds {
             requested: output_index,
-            available: evaluator.num_outputs(),
+            available: eval.num_outputs(),
         });
     }
+    Ok(())
+}
 
-    let mut pattern = Vec::with_capacity(width * height);
-    let mut scratch = evaluator.create_scratchpad();
-
-    // For mapping pixel indices to [-1, 1] range:
-    // - Single pixel (dim=1): center at 0.0
-    // - Multiple pixels: span from -1.0 to +1.0 inclusive
-    let x_divisor = if width > 1 { (width - 1) as f32 } else { 1.0 };
-    let y_divisor = if height > 1 { (height - 1) as f32 } else { 1.0 };
-
-    // Pre-allocate buffers for allocation-free inner loop
-    let mut inputs = [0.0f32; 2];
-    let mut outputs = vec![0.0f32; evaluator.num_outputs()];
-
-    for y in 0..height {
-        for x in 0..width {
-            // Normalize coordinates to [-1, 1]
-            // For dim=1: coordinate is 0.0 (centered)
-            // For dim>1: maps [0, dim-1] to [-1, 1]
-            inputs[0] = if width == 1 {
-                0.0
-            } else {
-                (x as f32 / x_divisor).mul_add(2.0, -1.0)
-            };
-            inputs[1] = if height == 1 {
-                0.0
-            } else {
-                (y as f32 / y_divisor).mul_add(2.0, -1.0)
-            };
-
-            evaluator.evaluate_into(&inputs, &mut outputs, &mut scratch);
-            // SAFETY: We validated output_index at function entry
-            let value = outputs[output_index];
-
-            // Normalize output to [0, 1] based on activation function's range.
-            // This correctly handles all activations (ReLU, Identity, etc.),
-            // not just bounded ones like Tanh/Sigmoid.
-            let (min_val, max_val) = evaluator.output_activation(output_index).output_range();
-            let range = max_val - min_val;
-            let normalized = if range > 0.0 {
-                (value - min_val) / range
-            } else {
-                0.5 // Degenerate case: single-value range
-            };
-            pattern.push(normalized.clamp(0.0, 1.0));
-        }
+fn validate_inputs(eval: &CppnEvaluator, expected: usize) -> Result<(), PatternError> {
+    if eval.num_inputs() != expected {
+        return Err(PatternError::InputArityMismatch {
+            expected,
+            actual: eval.num_inputs(),
+        });
     }
-
-    Ok(pattern)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -524,7 +490,7 @@ mod tests {
         let mut rng = test_rng();
         let genome = NeatGenome::fully_connected(config, &mut rng);
 
-        let evaluator = CppnEvaluator::new(&genome);
+        let evaluator = CppnEvaluator::new(&genome).unwrap();
 
         assert_eq!(evaluator.num_inputs(), 2);
         assert_eq!(evaluator.num_outputs(), 1);
@@ -539,7 +505,7 @@ mod tests {
         let mut rng = test_rng();
         let genome = NeatGenome::fully_connected(config, &mut rng);
 
-        let evaluator = CppnEvaluator::new(&genome);
+        let evaluator = CppnEvaluator::new(&genome).unwrap();
 
         let outputs1 = evaluator.evaluate(&[0.5, -0.5]);
         let outputs2 = evaluator.evaluate(&[0.5, -0.5]);
@@ -560,7 +526,7 @@ mod tests {
         let conn_id = genome.connections.iter().next().unwrap().0;
         genome.add_node(conn_id, &mut rng);
 
-        let evaluator = CppnEvaluator::new(&genome);
+        let evaluator = CppnEvaluator::new(&genome).unwrap();
         let outputs = evaluator.evaluate(&[1.0, 0.0]);
 
         assert_eq!(outputs.len(), 1);
@@ -573,7 +539,7 @@ mod tests {
         let mut rng = test_rng();
         let genome = NeatGenome::fully_connected(config, &mut rng);
 
-        let evaluator = CppnEvaluator::new(&genome);
+        let evaluator = CppnEvaluator::new(&genome).unwrap();
 
         let out_3d = evaluator.query_3d(0.0, 0.0, 0.0);
         assert_eq!(out_3d.len(), 1);
@@ -585,12 +551,130 @@ mod tests {
         let mut rng = test_rng();
         let genome = NeatGenome::fully_connected(config, &mut rng);
 
-        let mut evaluator = CppnEvaluator::new(&genome);
-        let pattern = generate_pattern(&mut evaluator, 8, 8, 0).unwrap();
+        let evaluator = CppnEvaluator::new(&genome).unwrap();
+        let pattern = evaluator.generate_pattern_2d(8, 8, 0).unwrap();
 
         assert_eq!(pattern.len(), 64);
         for &val in &pattern {
             assert!((0.0..=1.0).contains(&val));
+        }
+    }
+
+    /// Cheap fingerprint: bit-or all f32 raw representations together.
+    /// Two patterns produce identical fingerprints only if every pixel
+    /// matches bit-for-bit. Sufficient for regression detection.
+    fn pattern_fingerprint(pattern: &[f32]) -> u64 {
+        // FNV-1a over the f32 bit patterns — deterministic, zero-allocation,
+        // and surfaces single-pixel changes.
+        let mut hash: u64 = 0xcbf29ce484222325;
+        for &v in pattern {
+            for byte in v.to_bits().to_le_bytes() {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(0x100000001b3);
+            }
+        }
+        hash
+    }
+
+    #[test]
+    fn test_generate_pattern_2d_deterministic_checksum() {
+        let config = NeatConfig::cppn(2, 1);
+        let mut rng = ChaCha8Rng::seed_from_u64(12345);
+        let genome = NeatGenome::fully_connected(config, &mut rng);
+        let evaluator = CppnEvaluator::new(&genome).unwrap();
+
+        let pattern = evaluator.generate_pattern_2d(16, 16, 0).unwrap();
+        assert_eq!(pattern.len(), 256);
+
+        // Regenerate with the same seed; pattern must be bit-identical.
+        let mut rng2 = ChaCha8Rng::seed_from_u64(12345);
+        let genome2 = NeatGenome::fully_connected(NeatConfig::cppn(2, 1), &mut rng2);
+        let evaluator2 = CppnEvaluator::new(&genome2).unwrap();
+        let pattern2 = evaluator2.generate_pattern_2d(16, 16, 0).unwrap();
+
+        assert_eq!(
+            pattern_fingerprint(&pattern),
+            pattern_fingerprint(&pattern2),
+            "generate_pattern_2d must be deterministic for a fixed seed"
+        );
+    }
+
+    #[test]
+    fn test_generate_voxel_grid_basic() {
+        let config = NeatConfig::cppn(3, 1);
+        let mut rng = ChaCha8Rng::seed_from_u64(7);
+        let genome = NeatGenome::fully_connected(config, &mut rng);
+        let evaluator = CppnEvaluator::new(&genome).unwrap();
+
+        let grid = evaluator.generate_voxel_grid([4, 4, 4], 0).unwrap();
+        assert_eq!(grid.len(), 64);
+        for &v in &grid {
+            assert!((0.0..=1.0).contains(&v));
+        }
+    }
+
+    #[test]
+    fn test_generate_voxel_grid_deterministic_checksum() {
+        let config = NeatConfig::cppn(3, 1);
+        let mut rng = ChaCha8Rng::seed_from_u64(99);
+        let genome = NeatGenome::fully_connected(config, &mut rng);
+        let evaluator = CppnEvaluator::new(&genome).unwrap();
+
+        let grid_a = evaluator.generate_voxel_grid([6, 5, 4], 0).unwrap();
+        let grid_b = evaluator.generate_voxel_grid([6, 5, 4], 0).unwrap();
+        assert_eq!(pattern_fingerprint(&grid_a), pattern_fingerprint(&grid_b));
+    }
+
+    #[test]
+    fn test_generate_pattern_input_arity_mismatch() {
+        // 3-input CPPN cannot drive a 2D pattern.
+        let config = NeatConfig::cppn(3, 1);
+        let mut rng = test_rng();
+        let genome = NeatGenome::fully_connected(config, &mut rng);
+        let evaluator = CppnEvaluator::new(&genome).unwrap();
+
+        let err = evaluator.generate_pattern_2d(4, 4, 0).unwrap_err();
+        match err {
+            PatternError::InputArityMismatch { expected, actual } => {
+                assert_eq!(expected, 2);
+                assert_eq!(actual, 3);
+            }
+            other => panic!("expected InputArityMismatch, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_generate_voxel_grid_input_arity_mismatch() {
+        // 2-input CPPN cannot drive a 3D voxel grid.
+        let config = NeatConfig::cppn(2, 1);
+        let mut rng = test_rng();
+        let genome = NeatGenome::fully_connected(config, &mut rng);
+        let evaluator = CppnEvaluator::new(&genome).unwrap();
+
+        let err = evaluator.generate_voxel_grid([4, 4, 4], 0).unwrap_err();
+        assert!(matches!(
+            err,
+            PatternError::InputArityMismatch { expected: 3, actual: 2 }
+        ));
+    }
+
+    #[cfg(feature = "image")]
+    #[test]
+    fn test_generate_image_dimensions_and_grayscale() {
+        let config = NeatConfig::cppn(2, 1);
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let genome = NeatGenome::fully_connected(config, &mut rng);
+        let evaluator = CppnEvaluator::new(&genome).unwrap();
+
+        let img = evaluator.generate_image(8, 8, 0).unwrap();
+        assert_eq!(img.width(), 8);
+        assert_eq!(img.height(), 8);
+        // Every pixel must be R=G=B (grayscale) and alpha=255.
+        for pixel in img.pixels() {
+            let [r, g, b, a] = pixel.0;
+            assert_eq!(r, g);
+            assert_eq!(g, b);
+            assert_eq!(a, 255);
         }
     }
 
@@ -601,18 +685,18 @@ mod tests {
         let mut rng = test_rng();
         let genome = NeatGenome::fully_connected(config, &mut rng);
 
-        let evaluator = CppnEvaluator::new(&genome);
-        evaluator.evaluate(&[1.0]); // Wrong number of inputs
+        let evaluator = CppnEvaluator::new(&genome).unwrap();
+        let _ = evaluator.evaluate(&[1.0]); // Wrong number of inputs
     }
 
     #[test]
-    fn test_try_new_returns_ok_for_acyclic_genome() {
+    fn test_new_returns_ok_for_acyclic_genome() {
         let config = NeatConfig::minimal(2, 1);
         let mut rng = test_rng();
         let genome = NeatGenome::fully_connected(config, &mut rng);
 
-        let result = CppnEvaluator::try_new(&genome);
-        assert!(result.is_ok(), "try_new should succeed for acyclic genome");
+        let result = CppnEvaluator::new(&genome);
+        assert!(result.is_ok(), "new should succeed for acyclic genome");
     }
 
     #[test]

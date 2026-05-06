@@ -25,7 +25,7 @@
 //! let genome = NeatGenome::fully_connected(config, &mut rng);
 //!
 //! // Compile and evaluate
-//! let mut evaluator = CppnEvaluator::new(&genome);
+//! let mut evaluator = CppnEvaluator::new(&genome).expect("acyclic genome");
 //! let output = evaluator.query_2d(0.5, -0.5);
 //! println!("Output: {:?}", output);
 //! ```
@@ -40,7 +40,7 @@
 //! struct XorFitness;
 //! impl Evaluator<NeatGenome> for XorFitness {
 //!     fn evaluate(&self, genome: &NeatGenome) -> (f32, Vec<f32>, Vec<f32>) {
-//!         let mut eval = CppnEvaluator::new(genome);
+//!         let mut eval = CppnEvaluator::new(genome).expect("acyclic genome");
 //!         let mut error = 0.0;
 //!
 //!         // XOR truth table
@@ -98,18 +98,25 @@ pub mod evaluator;
 pub mod gene;
 pub mod genome;
 pub mod innovation;
+pub mod network;
+pub mod species;
+pub mod substrate;
 pub mod topology;
 
 // Re-exports for convenience
 pub use activation::Activation;
-pub use evaluator::{
-    generate_pattern, CppnEvaluator, EvalScratchpad, EvaluatorError, PatternError,
-};
+pub use evaluator::{CppnEvaluator, EvalScratchpad, EvaluatorError, PatternError};
 pub use gene::{ConnectionGene, ConnectionId, NodeGene, NodeId, NodeType};
 pub use genome::{NeatConfig, NeatGenome};
 pub use innovation::{
     connection_innovation, node_split_innovation, split_connection_a_innovation,
     split_connection_b_innovation,
+};
+pub use network::{FeedforwardNetwork, Scratchpad};
+pub use species::NeatDistance;
+pub use substrate::{
+    substrate_to_network, GridSubstrate2D, GridSubstrate3D, LayeredSubstrate, Substrate,
+    SubstrateNode,
 };
 pub use topology::GraphTopology;
 
@@ -168,8 +175,8 @@ mod tests {
         let mut rng = ChaCha8Rng::seed_from_u64(42);
         let genome = NeatGenome::fully_connected(config, &mut rng);
 
-        let mut evaluator = CppnEvaluator::new(&genome);
-        let pattern = generate_pattern(&mut evaluator, 16, 16, 0).unwrap();
+        let evaluator = CppnEvaluator::new(&genome).unwrap();
+        let pattern = evaluator.generate_pattern_2d(16, 16, 0).unwrap();
 
         assert_eq!(pattern.len(), 256);
 

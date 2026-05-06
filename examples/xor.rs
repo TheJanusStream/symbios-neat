@@ -18,7 +18,11 @@ struct XorFitness;
 
 impl Evaluator<NeatGenome> for XorFitness {
     fn evaluate(&self, genome: &NeatGenome) -> (f32, Vec<f32>, Vec<f32>) {
-        let evaluator = CppnEvaluator::new(genome);
+        // CppnEvaluator::new returns Err if the genome contains cycles.
+        // Mutation can rarely produce cycles; assign worst fitness rather than crash.
+        let Ok(evaluator) = CppnEvaluator::new(genome) else {
+            return (0.0, vec![0.0], vec![]);
+        };
         let mut total_error = 0.0;
 
         // XOR truth table
@@ -142,7 +146,8 @@ fn main() {
 
     // Test the champion
     println!("\nChampion XOR outputs:");
-    let eval = CppnEvaluator::new(&champion.genotype);
+    let eval = CppnEvaluator::new(&champion.genotype)
+        .expect("champion genome should be acyclic; check break_cycles invariant");
 
     let test_cases = [
         ([0.0_f32, 0.0], 0.0_f32),
