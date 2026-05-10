@@ -115,8 +115,8 @@ pub use innovation::{
 pub use network::{FeedforwardNetwork, Scratchpad};
 pub use species::NeatDistance;
 pub use substrate::{
-    substrate_to_network, GridSubstrate2D, GridSubstrate3D, LayeredSubstrate, Substrate,
-    SubstrateNode,
+    GridSubstrate2D, GridSubstrate3D, LayeredSubstrate, Substrate, SubstrateNode,
+    substrate_to_network,
 };
 pub use topology::GraphTopology;
 

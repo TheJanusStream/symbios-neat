@@ -4,8 +4,8 @@ use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use symbios_genetics::Genotype;
 use symbios_neat::{
-    connection_innovation, node_split_innovation, Activation, CppnEvaluator, NeatConfig,
-    NeatGenome, NodeType,
+    Activation, CppnEvaluator, NeatConfig, NeatGenome, NodeType, connection_innovation,
+    node_split_innovation,
 };
 
 // =============================================================================
@@ -321,7 +321,8 @@ fn test_network_no_overflow_with_large_weights() {
     for _ in 0..5 {
         if let Some(conn_id) = genome
             .connections
-            .iter().find(|(_, c)| c.enabled)
+            .iter()
+            .find(|(_, c)| c.enabled)
             .map(|(id, _)| id)
         {
             genome.add_node(conn_id, &mut rng);
@@ -357,7 +358,8 @@ fn test_update_depths_terminates() {
     for _ in 0..20 {
         if let Some(conn_id) = genome
             .connections
-            .iter().find(|(_, c)| c.enabled)
+            .iter()
+            .find(|(_, c)| c.enabled)
             .map(|(id, _)| id)
         {
             genome.add_node(conn_id, &mut rng);
@@ -1085,7 +1087,8 @@ fn test_cppn_produces_spatial_patterns() {
     for _ in 0..3 {
         if let Some(conn_id) = genome
             .connections
-            .iter().find(|(_, c)| c.enabled)
+            .iter()
+            .find(|(_, c)| c.enabled)
             .map(|(id, _)| id)
         {
             genome.add_node(conn_id, &mut rng);
@@ -1386,7 +1389,8 @@ fn test_deep_network_no_stack_overflow_has_cycle() {
         // Find an enabled connection to split
         if let Some(conn_id) = genome
             .connections
-            .iter().find(|(_, c)| c.enabled)
+            .iter()
+            .find(|(_, c)| c.enabled)
             .map(|(id, _)| id)
         {
             genome.add_node(conn_id, &mut rng);
@@ -1417,7 +1421,8 @@ fn test_deep_network_no_stack_overflow_break_cycles() {
     for _ in 0..500 {
         if let Some(conn_id) = genome
             .connections
-            .iter().find(|(_, c)| c.enabled)
+            .iter()
+            .find(|(_, c)| c.enabled)
             .map(|(id, _)| id)
         {
             genome.add_node(conn_id, &mut rng);

@@ -14,10 +14,10 @@
 
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
-use symbios_genetics::{algorithms::simple::SimpleGA, Evaluator, Evolver};
+use symbios_genetics::{Evaluator, Evolver, algorithms::simple::SimpleGA};
 use symbios_neat::{
-    substrate::{substrate_to_network, LayeredSubstrate},
     Activation, CppnEvaluator, NeatConfig, NeatGenome, Substrate,
+    substrate::{LayeredSubstrate, substrate_to_network},
 };
 
 const EXPRESSION_THRESHOLD: f32 = 0.2;
@@ -92,7 +92,7 @@ fn main() {
     let mut best_fitness = f32::NEG_INFINITY;
     let mut solution_generation: Option<usize> = None;
 
-    for gen in 0..generations {
+    for gen_idx in 0..generations {
         ga.step(&evaluator);
 
         let pop = ga.population();
@@ -105,14 +105,14 @@ fn main() {
             best_fitness = best.fitness;
         }
         if best.fitness >= 3.9 && solution_generation.is_none() {
-            solution_generation = Some(gen);
+            solution_generation = Some(gen_idx);
         }
 
-        if gen % 10 == 0 || gen == generations - 1 {
+        if gen_idx % 10 == 0 || gen_idx == generations - 1 {
             let avg: f32 = pop.iter().map(|p| p.fitness).sum::<f32>() / pop.len() as f32;
             println!(
                 "Gen {:3}: best={:.4}, avg={:.4}, cppn_nodes={}, cppn_conns={}",
-                gen,
+                gen_idx,
                 best.fitness,
                 avg,
                 best.genotype.nodes.len(),
@@ -129,8 +129,8 @@ fn main() {
         .unwrap();
 
     println!("Best CPPN fitness: {:.4}", champion.fitness);
-    if let Some(gen) = solution_generation {
-        println!("Solution found at generation: {}", gen);
+    if let Some(gen_idx) = solution_generation {
+        println!("Solution found at generation: {}", gen_idx);
     } else {
         println!("(No solution found within {} generations.)", generations);
     }
@@ -149,7 +149,11 @@ fn main() {
     ] {
         let out = network.evaluate(inputs)[0];
         let rounded = if out > 0.5 { 1.0 } else { 0.0 };
-        let status = if (rounded - expected).abs() < 0.1 { "✓" } else { "✗" };
+        let status = if (rounded - expected).abs() < 0.1 {
+            "✓"
+        } else {
+            "✗"
+        };
         println!(
             "  {} XOR {} = {:.4} (expected {}) {}",
             inputs[0] as i32, inputs[1] as i32, out, *expected as i32, status

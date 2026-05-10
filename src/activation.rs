@@ -152,11 +152,7 @@ impl Activation {
                     return 0.0;
                 }
                 // For |x| > 26, result is effectively 0 (exp(-676) ≈ 0)
-                if x.abs() > 26.0 {
-                    0.0
-                } else {
-                    (-x * x).exp()
-                }
+                if x.abs() > 26.0 { 0.0 } else { (-x * x).exp() }
             }
             Self::Abs => {
                 // Clamp to prevent overflow propagation
@@ -165,11 +161,7 @@ impl Activation {
             Self::Step => {
                 // Standard Heaviside step function: f(x) = 1 for x >= 0, f(x) = 0 for x < 0
                 // step(+inf) = 1, step(-inf) = 0, step(0) = 1
-                if x >= 0.0 {
-                    1.0
-                } else {
-                    0.0
-                }
+                if x >= 0.0 { 1.0 } else { 0.0 }
             }
             Self::LeakyReLU => {
                 // Clamp to prevent overflow propagation

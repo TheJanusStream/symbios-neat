@@ -2,7 +2,7 @@
 
 use std::hint::black_box;
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use symbios_genetics::Genotype;

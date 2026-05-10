@@ -194,9 +194,9 @@ impl LayeredSubstrate {
         }
 
         let input_indices = (0..layer_sizes[0]).collect();
-        let output_indices =
-            (layer_offsets[num_layers - 1]..layer_offsets[num_layers - 1] + layer_sizes[num_layers - 1])
-                .collect();
+        let output_indices = (layer_offsets[num_layers - 1]
+            ..layer_offsets[num_layers - 1] + layer_sizes[num_layers - 1])
+            .collect();
 
         Self {
             nodes,
@@ -245,11 +245,7 @@ impl GridSubstrate2D {
     ///
     /// Panics if `num_inputs == 0` or `num_outputs == 0`.
     #[must_use]
-    pub fn sandwich(
-        num_inputs: usize,
-        num_outputs: usize,
-        output_activation: Activation,
-    ) -> Self {
+    pub fn sandwich(num_inputs: usize, num_outputs: usize, output_activation: Activation) -> Self {
         assert!(num_inputs > 0, "num_inputs must be positive");
         assert!(num_outputs > 0, "num_outputs must be positive");
 
@@ -291,12 +287,7 @@ impl Substrate for GridSubstrate2D {
     }
 }
 
-fn place_row(
-    nodes: &mut Vec<SubstrateNode>,
-    count: usize,
-    y: f32,
-    activation: Activation,
-) {
+fn place_row(nodes: &mut Vec<SubstrateNode>, count: usize, y: f32, activation: Activation) {
     for i in 0..count {
         let x = if count == 1 {
             0.0
@@ -498,7 +489,8 @@ pub fn substrate_to_network<S: Substrate>(
     // eval_order excludes inputs (they get values from the user) and the
     // bias node (set to 1 unconditionally). Substrates here have no explicit
     // bias node, so we just exclude inputs.
-    let inputs: std::collections::HashSet<usize> = substrate.input_indices().iter().copied().collect();
+    let inputs: std::collections::HashSet<usize> =
+        substrate.input_indices().iter().copied().collect();
     let eval_order: Vec<usize> = order.into_iter().filter(|i| !inputs.contains(i)).collect();
 
     let biases: Vec<f32> = nodes.iter().map(|n| n.bias).collect();

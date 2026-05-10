@@ -7,7 +7,7 @@
 
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
-use symbios_genetics::{algorithms::simple::SimpleGA, Evaluator, Evolver};
+use symbios_genetics::{Evaluator, Evolver, algorithms::simple::SimpleGA};
 use symbios_neat::{CppnEvaluator, NeatConfig, NeatGenome};
 
 /// XOR fitness evaluator.
@@ -88,7 +88,7 @@ fn main() {
     let mut best_fitness = f32::NEG_INFINITY;
     let mut solution_generation = None;
 
-    for gen in 0..generations {
+    for gen_idx in 0..generations {
         ga.step(&evaluator);
 
         // Find best individual
@@ -104,11 +104,11 @@ fn main() {
 
         // Check for solution (fitness >= 3.9 is close enough)
         if best.fitness >= 3.9 && solution_generation.is_none() {
-            solution_generation = Some(gen);
+            solution_generation = Some(gen_idx);
         }
 
         // Print progress every 10 generations
-        if gen % 10 == 0 || gen == generations - 1 {
+        if gen_idx % 10 == 0 || gen_idx == generations - 1 {
             let avg_fitness: f32 =
                 population.iter().map(|p| p.fitness).sum::<f32>() / population.len() as f32;
             let best_nodes = best.genotype.nodes.len();
@@ -116,7 +116,7 @@ fn main() {
 
             println!(
                 "Gen {:3}: best={:.4}, avg={:.4}, nodes={}, connections={}",
-                gen, best.fitness, avg_fitness, best_nodes, best_conns
+                gen_idx, best.fitness, avg_fitness, best_nodes, best_conns
             );
         }
     }
@@ -140,8 +140,8 @@ fn main() {
     );
     println!("Hidden nodes: {}", champion.genotype.hidden_ids().len());
 
-    if let Some(gen) = solution_generation {
-        println!("Solution found at generation: {}", gen);
+    if let Some(gen_idx) = solution_generation {
+        println!("Solution found at generation: {}", gen_idx);
     }
 
     // Test the champion

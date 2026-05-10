@@ -654,7 +654,10 @@ mod tests {
         let err = evaluator.generate_voxel_grid([4, 4, 4], 0).unwrap_err();
         assert!(matches!(
             err,
-            PatternError::InputArityMismatch { expected: 3, actual: 2 }
+            PatternError::InputArityMismatch {
+                expected: 3,
+                actual: 2
+            }
         ));
     }
 

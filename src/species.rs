@@ -58,7 +58,7 @@ mod tests {
     use super::*;
     use rand::SeedableRng;
     use rand_chacha::ChaCha8Rng;
-    use symbios_genetics::{speciation::Speciation, Genotype, Phenotype};
+    use symbios_genetics::{Genotype, Phenotype, speciation::Speciation};
 
     use crate::NeatConfig;
 
@@ -127,7 +127,11 @@ mod tests {
         let mut spec = Speciation::new(NeatDistance, 1.0, 5);
         spec.assign(&pop);
         let total: usize = spec.species().iter().map(|s| s.member_indices.len()).sum();
-        assert_eq!(total, pop.len(), "every phenotype should be in some species");
+        assert_eq!(
+            total,
+            pop.len(),
+            "every phenotype should be in some species"
+        );
     }
 
     #[test]
