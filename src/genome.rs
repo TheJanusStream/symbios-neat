@@ -444,10 +444,10 @@ impl NeatGenome {
 
         // Write depths back to nodes
         for (idx, depth) in depths.iter().enumerate() {
-            if let Some(node_id) = topo.node_id(idx) {
-                if let Some(node) = self.nodes.get_mut(node_id) {
-                    node.depth = *depth;
-                }
+            if let Some(node_id) = topo.node_id(idx)
+                && let Some(node) = self.nodes.get_mut(node_id)
+            {
+                node.depth = *depth;
             }
         }
 
