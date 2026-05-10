@@ -431,7 +431,7 @@ impl NeatGenome {
     /// This is critical for correct feedforward evaluation.
     ///
     /// Uses CSR-format GraphTopology with Kahn's algorithm for O(V+E) complexity
-    /// without per-call Vec<Vec<usize>> allocations.
+    /// without per-call `Vec<Vec<usize>>` allocations.
     ///
     /// Returns `true` if the graph is acyclic and depths were computed successfully,
     /// `false` if a cycle was detected.
@@ -457,7 +457,7 @@ impl NeatGenome {
     /// Check if the genome contains any cycles in its enabled connections.
     ///
     /// Uses CSR-format GraphTopology with Kahn's algorithm for O(V+E) complexity
-    /// without per-call Vec<Vec<usize>> allocations.
+    /// without per-call `Vec<Vec<usize>>` allocations.
     #[must_use]
     pub fn has_cycle(&self) -> bool {
         let topo = GraphTopology::from_genome(self);

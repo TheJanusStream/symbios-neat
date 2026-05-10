@@ -91,7 +91,7 @@ impl CppnEvaluator {
     /// use [`NeatGenome::break_cycles`] before constructing the evaluator.
     ///
     /// Uses shared GraphTopology for O(V+E) depth computation with CSR format,
-    /// avoiding duplicated Vec<Vec<usize>> allocations. Edges are sorted by
+    /// avoiding duplicated `Vec<Vec<usize>>` allocations. Edges are sorted by
     /// innovation number for deterministic floating-point summation order.
     ///
     /// # Errors

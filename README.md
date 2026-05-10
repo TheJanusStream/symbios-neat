@@ -16,7 +16,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-symbios-neat = "0.1.0"
+symbios-neat = "0.2"
 ```
 
 ## Quick Start
@@ -216,9 +216,10 @@ Convenience constructors:
 NeatGenome::minimal(config)           // Input/output nodes only
 NeatGenome::fully_connected(config, rng)  // All inputs connected to outputs
 
-// Mutation
+// Mutation (also implements `symbios_genetics::Genotype` for `mutate`/`crossover`)
 genome.add_connection(input_id, output_id, rng)  // Add a new connection
 genome.add_node(connection_id, rng)              // Split a connection with a new node
+genome.crossover_equal_fitness(&other, rng)      // Equal-fitness crossover variant
 
 // Topology
 genome.hidden_ids()                   // Get all hidden node IDs
@@ -226,6 +227,11 @@ genome.num_enabled_connections()      // Count active connections
 genome.has_cycle()                    // Check for cycles
 genome.break_cycles()                 // Remove cycle-causing connections
 genome.update_depths()                // Recompute topological depths
+genome.find_node_by_innovation(inn)
+genome.find_connection_by_innovation(inn)
+
+// Reshape I/O while preserving hidden topology and weights
+genome.resize_io(num_inputs, num_outputs, rng)
 
 // Speciation
 genome.compatibility_distance(&other) // Compute genetic distance
@@ -234,30 +240,44 @@ genome.compatibility_distance(&other) // Compute genetic distance
 ### CppnEvaluator
 
 ```rust
-// Construction
-CppnEvaluator::new(&genome)           // Panics on cyclic genome
-CppnEvaluator::try_new(&genome)       // Returns Result
+// Construction (returns Result<Self, EvaluatorError>; errors on cyclic genomes)
+CppnEvaluator::new(&genome)
 
 // Evaluation
-evaluator.evaluate(&[x, y])           // General evaluation
-evaluator.evaluate_into(&inputs, &mut outputs)  // Allocation-free
-evaluator.query_2d(x, y)              // 2D coordinates
-evaluator.query_3d(x, y, z)           // 3D coordinates
-evaluator.query_2d_with_distance(x, y)  // [x, y, sqrt(x^2+y^2)]
-evaluator.query_substrate(x1, y1, x2, y2)  // HyperNEAT-style
+evaluator.evaluate(&[x, y])                                // Allocates output Vec
+evaluator.evaluate_into(&inputs, &mut outputs, &mut scratch) // Allocation-free
+evaluator.query_2d(x, y)                                   // 2D coordinates
+evaluator.query_3d(x, y, z)                                // 3D coordinates
+evaluator.query_2d_with_distance(x, y)                     // [x, y, sqrt(x^2+y^2)]
+evaluator.query_substrate(x1, y1, x2, y2)                  // HyperNEAT-style
 
-// Info
+// Info / utilities
 evaluator.num_inputs()
 evaluator.num_outputs()
+evaluator.output_activation(output_index)
+evaluator.create_scratchpad()      // Reusable EvalScratchpad for evaluate_into
+evaluator.network()                // Borrow underlying FeedforwardNetwork
+
+// Pattern / image export (return Result<_, PatternError>)
+evaluator.generate_pattern_2d(width, height, output_index)  // Vec<f32> in [0,1]
+evaluator.generate_voxel_grid([w, h, d], output_index)      // 3D voxel grid
+evaluator.generate_image(width, height, output_index)       // Requires `image` feature
 ```
 
-### Pattern Generation
+### Substrates (HyperNEAT)
 
 ```rust
-use symbios_neat::generate_pattern;
+use symbios_neat::{Substrate, GridSubstrate2D, GridSubstrate3D, LayeredSubstrate};
+use symbios_neat::substrate::substrate_to_network;
 
-let pattern = generate_pattern(&mut evaluator, width, height, output_index)?;
-// Returns Vec<f32> with values in [0, 1]
+// Concrete substrate constructors
+LayeredSubstrate::new(&[2, 2, 1], hidden_activation, output_activation)
+GridSubstrate2D::sandwich(num_inputs, num_outputs, output_activation)
+GridSubstrate3D::sandwich(width, height, output_activation)
+
+// Materialize a substrate by querying the CPPN for each potential link.
+// Links with |weight| < expression_threshold are pruned.
+let network = substrate_to_network(&cppn, &substrate, expression_threshold);
 ```
 
 ## Examples

@@ -10,6 +10,11 @@
 //! - **Arena-Graph Model**: Cache-friendly `SlotMap` storage for nodes and connections
 //! - **CPPN Support**: Periodic and radial activation functions (Sine, Cosine, Gaussian, Abs)
 //!   for Compositional Pattern Producing Networks
+//! - **HyperNEAT Substrates**: Indirect encoding via [`substrate::substrate_to_network`],
+//!   with `LayeredSubstrate`, `GridSubstrate2D`, and `GridSubstrate3D` provided out of the box
+//! - **Pattern / Voxel / Image Export**: `generate_pattern_2d`, `generate_voxel_grid`,
+//!   and (with the `image` feature) `generate_image`
+//! - **Speciation**: [`species::NeatDistance`] adapter for `symbios_genetics::speciation`
 //! - **Genotype Trait**: Implements `symbios_genetics::Genotype` for use with evolutionary algorithms
 //!
 //! ## Quick Start
@@ -24,8 +29,9 @@
 //! let mut rng = ChaCha8Rng::seed_from_u64(42);
 //! let genome = NeatGenome::fully_connected(config, &mut rng);
 //!
-//! // Compile and evaluate
-//! let mut evaluator = CppnEvaluator::new(&genome).expect("acyclic genome");
+//! // Compile and evaluate. `new` returns `Result<_, EvaluatorError>` —
+//! // it errors on cyclic genomes; call `genome.break_cycles()` first if needed.
+//! let evaluator = CppnEvaluator::new(&genome).expect("acyclic genome");
 //! let output = evaluator.query_2d(0.5, -0.5);
 //! println!("Output: {:?}", output);
 //! ```
@@ -40,7 +46,10 @@
 //! struct XorFitness;
 //! impl Evaluator<NeatGenome> for XorFitness {
 //!     fn evaluate(&self, genome: &NeatGenome) -> (f32, Vec<f32>, Vec<f32>) {
-//!         let mut eval = CppnEvaluator::new(genome).expect("acyclic genome");
+//!         // CppnEvaluator::new returns Err on cyclic genomes; assign worst fitness if so.
+//!         let Ok(eval) = CppnEvaluator::new(genome) else {
+//!             return (0.0, vec![0.0], vec![]);
+//!         };
 //!         let mut error = 0.0;
 //!
 //!         // XOR truth table

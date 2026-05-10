@@ -1,7 +1,7 @@
 //! Graph topology analysis using CSR format.
 //!
 //! This module provides efficient graph algorithms for NEAT genomes using
-//! Compressed Sparse Row (CSR) format. CSR eliminates per-call Vec<Vec<usize>>
+//! Compressed Sparse Row (CSR) format. CSR eliminates per-call `Vec<Vec<usize>>`
 //! allocations that cause allocator pressure in evolutionary loops.
 //!
 //! ## Determinism
@@ -410,8 +410,8 @@ impl GraphTopology {
 
     /// Get CSR data for forward edges (for evaluator construction).
     ///
-    /// Returns (offsets, sources, weights) where for node i, incoming edges
-    /// are at indices [offsets[i]..offsets[i+1]].
+    /// Returns `(offsets, sources, weights)` where for node `i`, incoming edges
+    /// are at indices `offsets[i]..offsets[i+1]`.
     pub fn get_csr_for_evaluation(
         &self,
         genome: &NeatGenome,
