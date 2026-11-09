@@ -32,9 +32,7 @@ impl Scratchpad {
 
     #[inline]
     fn reset(&mut self) {
-        for a in &mut self.activations {
-            *a = 0.0;
-        }
+        self.activations.fill(0.0);
     }
 }
 
