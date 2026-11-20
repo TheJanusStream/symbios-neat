@@ -11,7 +11,9 @@
 //! - **CPPN Support**: Periodic and radial activation functions (Sine, Cosine, Gaussian, Abs)
 //!   for Compositional Pattern Producing Networks
 //! - **HyperNEAT Substrates**: Indirect encoding via [`substrate::substrate_to_network`],
-//!   with `LayeredSubstrate`, `GridSubstrate2D`, and `GridSubstrate3D` provided out of the box
+//!   with `LayeredSubstrate`, `GridSubstrate2D`, and `GridSubstrate3D` provided out of the box;
+//!   [`substrate::substrate_to_network_with`] and a [`substrate::SubstratePainter`] add
+//!   per-link-kind CPPN outputs, link expression, extra CPPN inputs and painted biases
 //! - **Pattern / Voxel / Image Export**: `generate_pattern_2d`, `generate_voxel_grid`,
 //!   and (with the `image` feature) `generate_image`
 //! - **Speciation**: [`species::NeatDistance`] adapter for `symbios_genetics::speciation`
@@ -124,8 +126,8 @@ pub use innovation::{
 pub use network::{FeedforwardNetwork, Scratchpad};
 pub use species::NeatDistance;
 pub use substrate::{
-    GridSubstrate2D, GridSubstrate3D, LayeredSubstrate, Substrate, SubstrateNode,
-    substrate_to_network,
+    GridSubstrate2D, GridSubstrate3D, LayeredSubstrate, Substrate, SubstrateNode, SubstratePainter,
+    ThresholdPainter, substrate_to_network, substrate_to_network_with, write_endpoints,
 };
 pub use topology::GraphTopology;
 

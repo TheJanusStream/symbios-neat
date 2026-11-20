@@ -11,12 +11,22 @@
 //! whose absolute weight falls below an expression threshold (a standard
 //! HyperNEAT prune), and topologically sorts the surviving graph.
 //!
+//! [`substrate_to_network_with`] does the same with a [`SubstratePainter`]
+//! deciding what the CPPN is asked and what its answers mean, for the
+//! refinements classic HyperNEAT leaves out: a separate CPPN output per kind
+//! of link (multi-spatial substrates), a link-expression output that decides
+//! which links exist, CPPN inputs beyond the two positions (such as their
+//! distance), and painted node biases. [`ThresholdPainter`] is the classic
+//! scheme as a painter.
+//!
 //! # Coordinate convention
 //!
 //! All concrete substrates here place coordinates in `[-1, 1]` along each
-//! axis. The CPPN must accept `2 * coord_dim` inputs — source coordinates
-//! followed by target coordinates. For a 2D substrate that's 4 inputs, the
-//! same shape as [`CppnEvaluator::query_substrate`].
+//! axis. For [`substrate_to_network`] the CPPN must accept `2 * coord_dim`
+//! inputs: source coordinates followed by target coordinates. For a 2D
+//! substrate that's 4 inputs, the same shape as
+//! [`CppnEvaluator::query_substrate`]. With a [`SubstratePainter`], the
+//! CPPN takes whatever the painter's queries hold.
 //!
 //! # Example
 //!
@@ -43,7 +53,7 @@
 //! assert_eq!(network.num_outputs(), 1);
 //! ```
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 
 use crate::activation::Activation;
 use crate::evaluator::CppnEvaluator;
@@ -399,13 +409,157 @@ fn place_plane(
     }
 }
 
+/// Decides how a CPPN paints a substrate: what to ask it about each
+/// potential link and node, and what its answers mean.
+/// [`substrate_to_network_with`] does the rest: it evaluates the CPPN, keeps
+/// the links the painter expresses and assembles them into a
+/// [`FeedforwardNetwork`].
+///
+/// [`ThresholdPainter`] is classic HyperNEAT: the source's coordinates, then
+/// the target's; output 0 as the weight; a magnitude threshold. Write your
+/// own painter to
+///
+/// - give each kind of link its own CPPN output (a multi-spatial substrate,
+///   Pugh and Stanley 2013), with the kinds kept however your substrate likes;
+/// - decide which links exist with a dedicated output (link expression,
+///   Verbancsics and Stanley 2011) rather than by the weight's magnitude;
+/// - feed the CPPN more than the two positions, such as their distance;
+/// - paint node biases.
+///
+/// Every query buffer holds one value per CPPN input and starts zeroed.
+///
+/// # Example
+///
+/// A painter for a `[2, 2, 1]` layered substrate whose CPPN takes
+/// `(x1, y1, x2, y2, distance)` and has four outputs: the input-to-hidden
+/// weight, the hidden-to-output weight, link expression, and bias.
+///
+/// ```rust
+/// use symbios_neat::substrate::{
+///     substrate_to_network_with, write_endpoints, LayeredSubstrate, Substrate, SubstratePainter,
+/// };
+/// use symbios_neat::{Activation, CppnEvaluator, NeatConfig, NeatGenome};
+/// use rand::SeedableRng;
+/// use rand_chacha::ChaCha8Rng;
+///
+/// struct LeoPainter;
+///
+/// impl SubstratePainter<LayeredSubstrate> for LeoPainter {
+///     fn link_query(&self, substrate: &LayeredSubstrate, link: usize, query: &mut [f32]) {
+///         let written = write_endpoints(substrate, link, query);
+///         let (from, to) = substrate.links()[link];
+///         let (a, b) = (&substrate.nodes()[from].coords, &substrate.nodes()[to].coords);
+///         query[written] = a.iter().zip(b).map(|(p, q)| (p - q).powi(2)).sum::<f32>().sqrt();
+///     }
+///
+///     fn link_weight(&self, substrate: &LayeredSubstrate, link: usize, out: &[f32]) -> Option<f32> {
+///         if out[2] <= 0.0 {
+///             return None; // not expressed
+///         }
+///         let (from, _) = substrate.links()[link];
+///         let from_inputs = substrate.input_indices().contains(&from);
+///         Some(3.0 * if from_inputs { out[0] } else { out[1] })
+///     }
+///
+///     fn bias_query(&self, substrate: &LayeredSubstrate, node: usize, query: &mut [f32]) -> bool {
+///         let at = &substrate.nodes()[node].coords;
+///         query[..2].copy_from_slice(at);
+///         query[2..4].copy_from_slice(at);
+///         true
+///     }
+///
+///     fn bias(&self, _substrate: &LayeredSubstrate, _node: usize, out: &[f32]) -> f32 {
+///         out[3]
+///     }
+/// }
+///
+/// let substrate = LayeredSubstrate::new(&[2, 2, 1], Activation::Tanh, Activation::Tanh);
+/// let mut rng = ChaCha8Rng::seed_from_u64(1);
+/// let genome = NeatGenome::fully_connected(NeatConfig::cppn(5, 4), &mut rng);
+/// let cppn = CppnEvaluator::new(&genome).unwrap();
+/// let network = substrate_to_network_with(&cppn, &substrate, &LeoPainter);
+/// assert_eq!(network.num_inputs(), 2);
+/// assert_eq!(network.num_outputs(), 1);
+/// ```
+pub trait SubstratePainter<S: Substrate + ?Sized> {
+    /// Fills `query` with the CPPN inputs for the potential link
+    /// `substrate.links()[link]`.
+    fn link_query(&self, substrate: &S, link: usize, query: &mut [f32]);
+
+    /// The weight of link `link`, given the CPPN's `outputs` for its query.
+    /// `None` leaves the link out of the network, and so does a weight that
+    /// is not finite.
+    fn link_weight(&self, substrate: &S, link: usize, outputs: &[f32]) -> Option<f32>;
+
+    /// Fills `query` with the CPPN inputs for node `node`'s bias and returns
+    /// `true`, or returns `false` to keep its [`SubstrateNode::bias`], as the
+    /// default does. Never asked about input nodes, whose values are given.
+    fn bias_query(&self, substrate: &S, node: usize, query: &mut [f32]) -> bool {
+        let _ = (substrate, node, query);
+        false
+    }
+
+    /// The bias of node `node`, given the CPPN's `outputs` for its bias
+    /// query; asked only when [`bias_query`](Self::bias_query) returned
+    /// `true`. The default keeps the node's own bias, and so does a bias
+    /// that is not finite.
+    fn bias(&self, substrate: &S, node: usize, outputs: &[f32]) -> f32 {
+        let _ = outputs;
+        substrate.nodes()[node].bias
+    }
+}
+
+/// Classic HyperNEAT painting, as [`substrate_to_network`] does it: the CPPN
+/// is asked with the source's coordinates followed by the target's, output 0
+/// is the link's weight, links weaker than `threshold` are left out, and
+/// nodes keep their own biases.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ThresholdPainter {
+    /// Links with `|weight| < threshold` are pruned; typically in
+    /// `[0.1, 0.3]`.
+    pub threshold: f32,
+}
+
+impl<S: Substrate + ?Sized> SubstratePainter<S> for ThresholdPainter {
+    fn link_query(&self, substrate: &S, link: usize, query: &mut [f32]) {
+        write_endpoints(substrate, link, query);
+    }
+
+    fn link_weight(&self, _substrate: &S, _link: usize, outputs: &[f32]) -> Option<f32> {
+        let weight = outputs[0];
+        (weight.abs() >= self.threshold).then_some(weight)
+    }
+}
+
+/// Writes the coordinates of link `link`'s source node, then its target
+/// node's, to the front of `query`, and returns how many values it wrote, so
+/// that a painter can append values of its own after them (such as the two
+/// nodes' distance).
+///
+/// # Panics
+///
+/// Panics if `query` is too short for both nodes' coordinates.
+pub fn write_endpoints<S: Substrate + ?Sized>(
+    substrate: &S,
+    link: usize,
+    query: &mut [f32],
+) -> usize {
+    let (source, target) = substrate.links()[link];
+    let nodes = substrate.nodes();
+    let (from, to) = (&nodes[source].coords, &nodes[target].coords);
+    query[..from.len()].copy_from_slice(from);
+    query[from.len()..from.len() + to.len()].copy_from_slice(to);
+    from.len() + to.len()
+}
+
 /// Materialize a substrate into an executable [`FeedforwardNetwork`] by
 /// querying the CPPN for every potential link's weight.
 ///
 /// Links whose absolute returned weight is below `expression_threshold` are
 /// pruned (a standard HyperNEAT optimization that exploits the CPPN's ability
 /// to represent regions of "no connection"). The expression threshold is
-/// typically in `[0.1, 0.3]`.
+/// typically in `[0.1, 0.3]`. This is [`substrate_to_network_with`] with a
+/// [`ThresholdPainter`].
 ///
 /// # Panics
 ///
@@ -418,7 +572,6 @@ pub fn substrate_to_network<S: Substrate>(
     expression_threshold: f32,
 ) -> FeedforwardNetwork {
     let coord_dim = substrate.coord_dim();
-    let nodes = substrate.nodes();
     assert_eq!(
         cppn.num_inputs(),
         2 * coord_dim,
@@ -426,28 +579,94 @@ pub fn substrate_to_network<S: Substrate>(
         2 * coord_dim,
         cppn.num_inputs()
     );
+    substrate_to_network_with(
+        cppn,
+        substrate,
+        &ThresholdPainter {
+            threshold: expression_threshold,
+        },
+    )
+}
 
-    // Query the CPPN once per potential link, prune below threshold.
-    let mut cppn_inputs = vec![0.0f32; cppn.num_inputs()];
-    let mut cppn_outputs = vec![0.0f32; cppn.num_outputs()];
+/// Materialize a substrate into an executable [`FeedforwardNetwork`], with
+/// `painter` deciding what the CPPN is asked about each potential link and
+/// non-input node and what its answers mean (see [`SubstratePainter`]).
+///
+/// The surviving links are topologically sorted; nodes left in a cycle, or
+/// unreachable, receive no activation (the natural HyperNEAT reading of an
+/// unexpressed region). The network's inputs and outputs are the
+/// substrate's, in its order.
+///
+/// # Panics
+///
+/// Panics if the substrate's links reference out-of-range indices, or if the
+/// painter writes past the CPPN's inputs or reads past its outputs.
+#[must_use]
+pub fn substrate_to_network_with<S, P>(
+    cppn: &CppnEvaluator,
+    substrate: &S,
+    painter: &P,
+) -> FeedforwardNetwork
+where
+    S: Substrate + ?Sized,
+    P: SubstratePainter<S> + ?Sized,
+{
+    let nodes = substrate.nodes();
+    let mut query = vec![0.0f32; cppn.num_inputs()];
+    let mut outputs = vec![0.0f32; cppn.num_outputs()];
     let mut scratch = cppn.create_scratchpad();
+
+    // Ask the CPPN about every potential link; keep the expressed ones.
     let mut kept_links: Vec<(usize, usize, f32)> = Vec::new();
-    for &(src, tgt) in substrate.links() {
+    for (index, &(src, tgt)) in substrate.links().iter().enumerate() {
         assert!(src < nodes.len() && tgt < nodes.len(), "link out of bounds");
-        cppn_inputs[..coord_dim].copy_from_slice(&nodes[src].coords);
-        cppn_inputs[coord_dim..].copy_from_slice(&nodes[tgt].coords);
-        cppn.evaluate_into(&cppn_inputs, &mut cppn_outputs, &mut scratch);
-        let w = cppn_outputs[0];
-        if w.abs() >= expression_threshold {
-            kept_links.push((src, tgt, w));
+        query.fill(0.0);
+        painter.link_query(substrate, index, &mut query);
+        cppn.evaluate_into(&query, &mut outputs, &mut scratch);
+        if let Some(weight) = painter.link_weight(substrate, index, &outputs)
+            && weight.is_finite()
+        {
+            kept_links.push((src, tgt, weight));
         }
     }
+
+    // Paint the biases the painter asks for. Inputs get theirs from the
+    // caller, so they are never asked about.
+    let inputs: HashSet<usize> = substrate.input_indices().iter().copied().collect();
+    let biases: Vec<f32> = (0..nodes.len())
+        .map(|node| {
+            let own = nodes[node].bias;
+            if inputs.contains(&node) {
+                return own;
+            }
+            query.fill(0.0);
+            if !painter.bias_query(substrate, node, &mut query) {
+                return own;
+            }
+            cppn.evaluate_into(&query, &mut outputs, &mut scratch);
+            let bias = painter.bias(substrate, node, &outputs);
+            if bias.is_finite() { bias } else { own }
+        })
+        .collect();
+
+    assemble(substrate, &kept_links, biases, &inputs)
+}
+
+/// Builds the network from the expressed links: Kahn's topological order,
+/// then predecessor CSR in link order.
+fn assemble<S: Substrate + ?Sized>(
+    substrate: &S,
+    kept_links: &[(usize, usize, f32)],
+    biases: Vec<f32>,
+    inputs: &HashSet<usize>,
+) -> FeedforwardNetwork {
+    let nodes = substrate.nodes();
 
     // Topologically sort surviving graph via Kahn's algorithm.
     let n = nodes.len();
     let mut in_degree = vec![0usize; n];
     let mut successors: Vec<Vec<(usize, f32)>> = vec![Vec::new(); n];
-    for &(src, tgt, w) in &kept_links {
+    for &(src, tgt, w) in kept_links {
         in_degree[tgt] += 1;
         successors[src].push((tgt, w));
     }
@@ -470,7 +689,7 @@ pub fn substrate_to_network<S: Substrate>(
 
     // Build CSR for incoming connections (FeedforwardNetwork stores predecessors).
     let mut incoming: Vec<Vec<(usize, f32)>> = vec![Vec::new(); n];
-    for &(src, tgt, w) in &kept_links {
+    for &(src, tgt, w) in kept_links {
         incoming[tgt].push((src, w));
     }
 
@@ -489,11 +708,8 @@ pub fn substrate_to_network<S: Substrate>(
     // eval_order excludes inputs (they get values from the user) and the
     // bias node (set to 1 unconditionally). Substrates here have no explicit
     // bias node, so we just exclude inputs.
-    let inputs: std::collections::HashSet<usize> =
-        substrate.input_indices().iter().copied().collect();
     let eval_order: Vec<usize> = order.into_iter().filter(|i| !inputs.contains(i)).collect();
 
-    let biases: Vec<f32> = nodes.iter().map(|n| n.bias).collect();
     let activations: Vec<Activation> = nodes.iter().map(|n| n.activation).collect();
 
     FeedforwardNetwork {
@@ -602,9 +818,10 @@ mod tests {
         let kept = substrate_to_network(&cppn, &substrate, 0.0);
         let pruned = substrate_to_network(&cppn, &substrate, 100.0);
 
-        // The pruned network has empty CSR; we can't easily compare counts
-        // without internal access, so check that pruned still produces finite
-        // output (zeros propagate through activations).
+        // Threshold 0 keeps every potential link (2 x 2 + 2 x 1); the high
+        // threshold keeps none, and zeros still propagate to a finite output.
+        assert_eq!(kept.num_connections(), 6);
+        assert_eq!(pruned.num_connections(), 0);
         let out = pruned.evaluate(&[0.5, -0.5]);
         assert!(out[0].is_finite());
 
@@ -621,5 +838,306 @@ mod tests {
         let cppn = dummy_cppn(3, 6);
         let substrate = LayeredSubstrate::new(&[2, 1], Activation::Tanh, Activation::Sigmoid);
         let _ = substrate_to_network(&cppn, &substrate, 0.0);
+    }
+
+    /// `substrate_to_network` as it was before painters, kept to prove the
+    /// painter-based version builds exactly the same networks.
+    fn classic_substrate_to_network<S: Substrate>(
+        cppn: &CppnEvaluator,
+        substrate: &S,
+        expression_threshold: f32,
+    ) -> FeedforwardNetwork {
+        let coord_dim = substrate.coord_dim();
+        let nodes = substrate.nodes();
+        let mut cppn_inputs = vec![0.0f32; cppn.num_inputs()];
+        let mut cppn_outputs = vec![0.0f32; cppn.num_outputs()];
+        let mut scratch = cppn.create_scratchpad();
+        let mut kept_links: Vec<(usize, usize, f32)> = Vec::new();
+        for &(src, tgt) in substrate.links() {
+            cppn_inputs[..coord_dim].copy_from_slice(&nodes[src].coords);
+            cppn_inputs[coord_dim..].copy_from_slice(&nodes[tgt].coords);
+            cppn.evaluate_into(&cppn_inputs, &mut cppn_outputs, &mut scratch);
+            let w = cppn_outputs[0];
+            if w.abs() >= expression_threshold {
+                kept_links.push((src, tgt, w));
+            }
+        }
+        let inputs: HashSet<usize> = substrate.input_indices().iter().copied().collect();
+        let biases = nodes.iter().map(|n| n.bias).collect();
+        assemble(substrate, &kept_links, biases, &inputs)
+    }
+
+    /// A CPPN with some hidden structure, from a seed.
+    fn evolved_cppn(seed: u64, inputs: usize) -> CppnEvaluator {
+        let mut rng = ChaCha8Rng::seed_from_u64(seed);
+        let mut genome = NeatGenome::fully_connected(NeatConfig::cppn(inputs, 1), &mut rng);
+        for _ in 0..5 {
+            symbios_genetics::Genotype::mutate(&mut genome, &mut rng, 1.0);
+        }
+        genome.break_cycles();
+        CppnEvaluator::new(&genome).unwrap()
+    }
+
+    #[test]
+    fn the_threshold_painter_builds_exactly_the_classic_network() {
+        for seed in 0..6 {
+            for threshold in [0.0, 0.2, 0.5] {
+                let layered = LayeredSubstrate::new(&[3, 4, 2], Activation::Tanh, Activation::Tanh);
+                let grid2 = GridSubstrate2D::sandwich(4, 3, Activation::Sigmoid);
+                let grid3 = GridSubstrate3D::sandwich(2, 3, Activation::Tanh);
+                let cppn2 = evolved_cppn(seed, 4);
+                let cppn3 = evolved_cppn(seed + 100, 6);
+                let pairs = [
+                    (
+                        substrate_to_network(&cppn2, &layered, threshold),
+                        classic_substrate_to_network(&cppn2, &layered, threshold),
+                    ),
+                    (
+                        substrate_to_network(&cppn2, &grid2, threshold),
+                        classic_substrate_to_network(&cppn2, &grid2, threshold),
+                    ),
+                    (
+                        substrate_to_network(&cppn3, &grid3, threshold),
+                        classic_substrate_to_network(&cppn3, &grid3, threshold),
+                    ),
+                ];
+                for (painted, classic) in pairs {
+                    assert_eq!(painted.num_connections(), classic.num_connections());
+                    let mut rng = ChaCha8Rng::seed_from_u64(seed);
+                    for _ in 0..4 {
+                        let input: Vec<f32> = (0..painted.num_inputs())
+                            .map(|_| rand::Rng::random_range(&mut rng, -1.0..1.0))
+                            .collect();
+                        assert_eq!(painted.evaluate(&input), classic.evaluate(&input));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Two inputs and one identity output in 2D, linked by two links of
+    /// different kinds.
+    struct KindedSubstrate {
+        nodes: Vec<SubstrateNode>,
+        links: Vec<(usize, usize)>,
+        kinds: Vec<usize>,
+    }
+
+    impl KindedSubstrate {
+        fn new(input_positions: [[f32; 2]; 2], output_bias: f32) -> Self {
+            let node = |coords: [f32; 2], activation, bias| SubstrateNode {
+                coords: coords.to_vec(),
+                activation,
+                bias,
+            };
+            Self {
+                nodes: vec![
+                    node(input_positions[0], Activation::Identity, 0.0),
+                    node(input_positions[1], Activation::Identity, 0.0),
+                    node([0.0, 1.0], Activation::Identity, output_bias),
+                ],
+                links: vec![(0, 2), (1, 2)],
+                kinds: vec![0, 1],
+            }
+        }
+    }
+
+    impl Substrate for KindedSubstrate {
+        fn nodes(&self) -> &[SubstrateNode] {
+            &self.nodes
+        }
+        fn links(&self) -> &[(usize, usize)] {
+            &self.links
+        }
+        fn input_indices(&self) -> &[usize] {
+            &[0, 1]
+        }
+        fn output_indices(&self) -> &[usize] {
+            &[2]
+        }
+    }
+
+    /// A CPPN with no hidden nodes: output `k` is `tanh(bias_k + sum of
+    /// input_weights)` for each `(input, output, weight)` given.
+    fn wired_cppn(
+        inputs: usize,
+        outputs: usize,
+        wires: &[(Option<usize>, usize, f32)],
+    ) -> CppnEvaluator {
+        let mut genome = NeatGenome::minimal(NeatConfig::cppn(inputs, outputs));
+        let bias = genome.bias_id.unwrap();
+        for (i, &(input, output, weight)) in wires.iter().enumerate() {
+            let from = input.map_or(bias, |k| genome.input_ids[k]);
+            let to = genome.output_ids[output];
+            genome.connections.insert(crate::ConnectionGene::new(
+                1000 + i as u64,
+                from,
+                to,
+                weight,
+            ));
+        }
+        CppnEvaluator::new(&genome).unwrap()
+    }
+
+    /// Reads output `kind` as each link's weight, a link-expression output,
+    /// a distance appended to the endpoints, and a bias output.
+    struct KindPainter {
+        expression: Option<usize>,
+        bias: Option<usize>,
+    }
+
+    impl SubstratePainter<KindedSubstrate> for KindPainter {
+        fn link_query(&self, substrate: &KindedSubstrate, link: usize, query: &mut [f32]) {
+            let written = write_endpoints(substrate, link, query);
+            let (from, to) = substrate.links[link];
+            let (a, b) = (&substrate.nodes[from].coords, &substrate.nodes[to].coords);
+            query[written] = ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2)).sqrt();
+        }
+        fn link_weight(
+            &self,
+            substrate: &KindedSubstrate,
+            link: usize,
+            out: &[f32],
+        ) -> Option<f32> {
+            if self.expression.is_some_and(|leo| out[leo] <= 0.0) {
+                return None;
+            }
+            Some(out[substrate.kinds[link]])
+        }
+        fn bias_query(&self, substrate: &KindedSubstrate, node: usize, query: &mut [f32]) -> bool {
+            let at = &substrate.nodes[node].coords;
+            query[..2].copy_from_slice(at);
+            query[2..4].copy_from_slice(at);
+            self.bias.is_some()
+        }
+        fn bias(&self, _substrate: &KindedSubstrate, _node: usize, out: &[f32]) -> f32 {
+            out[self.bias.unwrap()]
+        }
+    }
+
+    #[test]
+    fn each_kind_of_link_can_read_its_own_cppn_output() {
+        let substrate = KindedSubstrate::new([[-1.0, 0.0], [1.0, 0.0]], 0.0);
+        let cppn = wired_cppn(5, 2, &[(None, 0, 0.5), (None, 1, -1.0)]);
+        let painter = KindPainter {
+            expression: None,
+            bias: None,
+        };
+        let network = substrate_to_network_with(&cppn, &substrate, &painter);
+        assert_eq!(network.num_connections(), 2);
+        assert!((network.evaluate(&[1.0, 0.0])[0] - 0.5f32.tanh()).abs() < 1e-6);
+        assert!((network.evaluate(&[0.0, 1.0])[0] - (-1.0f32).tanh()).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_link_expression_output_decides_which_links_exist() {
+        // Expression is tanh(5 * source x): off for the input at x = -1.
+        let substrate = KindedSubstrate::new([[-1.0, 0.0], [1.0, 0.0]], 0.0);
+        let cppn = wired_cppn(5, 3, &[(None, 0, 0.5), (None, 1, 0.8), (Some(0), 2, 5.0)]);
+        let painter = KindPainter {
+            expression: Some(2),
+            bias: None,
+        };
+        let network = substrate_to_network_with(&cppn, &substrate, &painter);
+        assert_eq!(network.num_connections(), 1);
+        assert_eq!(network.evaluate(&[1.0, 0.0])[0], 0.0);
+        assert!((network.evaluate(&[0.0, 1.0])[0] - 0.8f32.tanh()).abs() < 1e-6);
+    }
+
+    #[test]
+    fn queries_can_carry_values_beyond_the_two_positions() {
+        // Weight tanh(distance): sqrt(2) for the first input, sqrt(0.5) for the second.
+        let substrate = KindedSubstrate::new([[-1.0, 0.0], [0.5, 0.5]], 0.0);
+        let cppn = wired_cppn(5, 2, &[(Some(4), 0, 1.0), (Some(4), 1, 1.0)]);
+        let painter = KindPainter {
+            expression: None,
+            bias: None,
+        };
+        let network = substrate_to_network_with(&cppn, &substrate, &painter);
+        let near = 0.5f32.sqrt().tanh();
+        let far = 2.0f32.sqrt().tanh();
+        assert!((network.evaluate(&[1.0, 0.0])[0] - far).abs() < 1e-6);
+        assert!((network.evaluate(&[0.0, 1.0])[0] - near).abs() < 1e-6);
+    }
+
+    #[test]
+    fn painted_biases_replace_a_nodes_own_unless_the_painter_declines() {
+        let substrate = KindedSubstrate::new([[-1.0, 0.0], [1.0, 0.0]], 0.25);
+        // No link is expressed; output 2 is the bias, tanh(0.7).
+        let cppn = wired_cppn(5, 3, &[(None, 1, -5.0), (None, 2, 0.7)]);
+        let painted = substrate_to_network_with(
+            &cppn,
+            &substrate,
+            &KindPainter {
+                expression: Some(1),
+                bias: Some(2),
+            },
+        );
+        assert!((painted.evaluate(&[1.0, 1.0])[0] - 0.7f32.tanh()).abs() < 1e-6);
+        let own = substrate_to_network_with(
+            &cppn,
+            &substrate,
+            &KindPainter {
+                expression: Some(1),
+                bias: None,
+            },
+        );
+        assert_eq!(own.evaluate(&[1.0, 1.0])[0], 0.25);
+    }
+
+    #[test]
+    fn input_nodes_are_never_asked_for_a_bias() {
+        struct Counting(std::cell::Cell<usize>);
+        impl SubstratePainter<LayeredSubstrate> for Counting {
+            fn link_query(&self, substrate: &LayeredSubstrate, link: usize, query: &mut [f32]) {
+                write_endpoints(substrate, link, query);
+            }
+            fn link_weight(&self, _: &LayeredSubstrate, _: usize, out: &[f32]) -> Option<f32> {
+                Some(out[0])
+            }
+            fn bias_query(&self, substrate: &LayeredSubstrate, node: usize, _: &mut [f32]) -> bool {
+                assert!(
+                    !substrate.input_indices().contains(&node),
+                    "asked about input {node}"
+                );
+                self.0.set(self.0.get() + 1);
+                false
+            }
+        }
+        let substrate = LayeredSubstrate::new(&[3, 2, 1], Activation::Tanh, Activation::Tanh);
+        let painter = Counting(std::cell::Cell::new(0));
+        let _ = substrate_to_network_with(&dummy_cppn(5, 4), &substrate, &painter);
+        assert_eq!(painter.0.get(), 3);
+    }
+
+    #[test]
+    fn answers_that_are_not_finite_are_ignored() {
+        struct Broken;
+        impl SubstratePainter<KindedSubstrate> for Broken {
+            fn link_query(&self, _: &KindedSubstrate, _: usize, _: &mut [f32]) {}
+            fn link_weight(&self, _: &KindedSubstrate, link: usize, _: &[f32]) -> Option<f32> {
+                Some(if link == 0 { f32::NAN } else { f32::INFINITY })
+            }
+            fn bias_query(&self, _: &KindedSubstrate, _: usize, _: &mut [f32]) -> bool {
+                true
+            }
+            fn bias(&self, _: &KindedSubstrate, _: usize, _: &[f32]) -> f32 {
+                f32::NAN
+            }
+        }
+        let substrate = KindedSubstrate::new([[-1.0, 0.0], [1.0, 0.0]], 0.25);
+        let network = substrate_to_network_with(&dummy_cppn(1, 4), &substrate, &Broken);
+        assert_eq!(network.num_connections(), 0);
+        assert_eq!(network.evaluate(&[1.0, 1.0])[0], 0.25);
+    }
+
+    #[test]
+    fn write_endpoints_writes_the_source_then_the_target() {
+        let substrate = LayeredSubstrate::new(&[2, 1], Activation::Tanh, Activation::Tanh);
+        let mut query = [9.0f32; 6];
+        let written = write_endpoints(&substrate, 1, &mut query);
+        assert_eq!(written, 4);
+        // Link 1 runs from the second input (1, -1) to the output (0, 1).
+        assert_eq!(query, [1.0, -1.0, 0.0, 1.0, 9.0, 9.0]);
     }
 }

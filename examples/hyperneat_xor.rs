@@ -10,6 +10,11 @@
 //! one weight per query. Evolving the CPPN with [`SimpleGA`] discovers weight
 //! patterns that, when expressed onto the substrate, solve XOR.
 //!
+//! Only weights are painted and the substrate's biases are zero, so for the
+//! inputs `(0, 0)` the sigmoid output is always exactly 0.5: this substrate
+//! can approach XOR but never output 0 there. `hyperneat_xor_painted` paints
+//! biases too, with a `SubstratePainter`, and solves it.
+//!
 //! Run with: `cargo run --example hyperneat_xor --release`
 
 use rand::SeedableRng;

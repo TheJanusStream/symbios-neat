@@ -69,6 +69,13 @@ impl FeedforwardNetwork {
         self.output_indices.len()
     }
 
+    /// Number of weighted connections the network evaluates: for a network
+    /// painted from a substrate, how many potential links were expressed.
+    #[must_use]
+    pub fn num_connections(&self) -> usize {
+        self.csr_sources.len()
+    }
+
     /// Activation function attached to a specific output node.
     ///
     /// # Panics

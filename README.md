@@ -140,6 +140,42 @@ let network = substrate_to_network(&cppn, &substrate, 0.2);
 let outputs = network.evaluate(&[0.5, -0.3]);
 ```
 
+`substrate_to_network` is classic HyperNEAT: the CPPN gets the source's and
+the target's coordinates, its output 0 is the weight, and links weaker than the
+threshold are pruned. For the refinements it leaves out, implement a
+`SubstratePainter` and call `substrate_to_network_with`. The painter fills each
+CPPN query and reads the answers, so it can:
+
+- give each kind of link its own CPPN output (multi-spatial substrates),
+- decide which links exist with a link-expression output (LEO) instead of a
+  threshold,
+- add CPPN inputs beyond the two positions, such as their distance,
+- paint node biases.
+
+```rust,ignore
+use symbios_neat::substrate::{
+    substrate_to_network_with, write_endpoints, Substrate, SubstratePainter,
+};
+
+struct Painter;
+
+impl<S: Substrate> SubstratePainter<S> for Painter {
+    fn link_query(&self, substrate: &S, link: usize, query: &mut [f32]) {
+        let written = write_endpoints(substrate, link, query); // x1, y1, x2, y2
+        query[written] = link_distance(substrate, link); // your own extra input
+    }
+    fn link_weight(&self, _substrate: &S, _link: usize, out: &[f32]) -> Option<f32> {
+        (out[1] > 0.0).then(|| 3.0 * out[0]) // output 1 decides expression
+    }
+}
+
+let network = substrate_to_network_with(&cppn, &substrate, &Painter);
+println!("{} links expressed", network.num_connections());
+```
+
+`bias_query` and `bias` paint node biases the same way. See the
+`SubstratePainter` docs for a complete, tested example.
+
 ## Architecture
 
 ### Hash-Based Innovation (Sovereign Innovation)
@@ -268,7 +304,10 @@ evaluator.generate_image(width, height, output_index)       // Requires `image` 
 
 ```rust
 use symbios_neat::{Substrate, GridSubstrate2D, GridSubstrate3D, LayeredSubstrate};
-use symbios_neat::substrate::substrate_to_network;
+use symbios_neat::substrate::{
+    substrate_to_network, substrate_to_network_with, write_endpoints, SubstratePainter,
+    ThresholdPainter,
+};
 
 // Concrete substrate constructors
 LayeredSubstrate::new(&[2, 2, 1], hidden_activation, output_activation)
@@ -278,6 +317,12 @@ GridSubstrate3D::sandwich(width, height, output_activation)
 // Materialize a substrate by querying the CPPN for each potential link.
 // Links with |weight| < expression_threshold are pruned.
 let network = substrate_to_network(&cppn, &substrate, expression_threshold);
+
+// Or let a SubstratePainter decide queries, weights, expression and biases.
+// ThresholdPainter { threshold } is the classic scheme above as a painter.
+let network = substrate_to_network_with(&cppn, &substrate, &painter);
+let written = write_endpoints(&substrate, link, &mut query); // painter helper
+network.num_connections()          // links the painting expressed
 ```
 
 ## Examples
@@ -287,6 +332,17 @@ Run the XOR example:
 ```bash
 cargo run --example xor
 ```
+
+HyperNEAT XOR, classic and with painted biases:
+
+```bash
+cargo run --release --example hyperneat_xor
+cargo run --release --example hyperneat_xor_painted
+```
+
+The classic substrate has no biases, so its output for `(0, 0)` is stuck at
+0.5; the painted variant asks the CPPN for each neuron's bias as well and
+solves XOR within ten generations.
 
 ## Benchmarks
 
